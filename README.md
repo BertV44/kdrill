@@ -135,6 +135,19 @@ oc apply --dry-run=server -f deploy/
    operator-managed resources. On failure, `KEEP_ON_FAILURE=true` retains them
    and dumps the pods that never became Ready.
 
+## Requirements
+
+| Requirement | Detail |
+|---|---|
+| Veeam Kasten | 9.0.x, installed and healthy. Earlier and later minors are not verified. |
+| OpenShift | 4.x. kdrill uses SCC annotations and `openshift-dns`, so it is not portable to vanilla Kubernetes as written. |
+| Exported restore points | At least one S3 location profile, and export policies that have actually produced exported restore points. kdrill restores from the export, not from local snapshots. |
+| Cluster privileges | `cluster-admin`, or enough to create a ClusterRole granting `delete` on namespaces, to apply `deploy/10-rbac.yaml`. |
+| Admission controller | Kyverno, or the ability to write a `ValidatingAdmissionPolicy`. Required for the guardrail described above, not optional in practice. |
+| Container image | `registry.redhat.io/openshift4/ose-cli`. The cluster needs a valid pull secret for `registry.redhat.io`, which OpenShift normally has as part of its global pull secret. |
+| Spare capacity | Enough headroom to provision the restored volumes alongside production. See [docs/sizing.md](docs/sizing.md). |
+| Optional | Prometheus and a Pushgateway, if you want the metrics off-cluster. Without them, metrics are still written to the job log. |
+
 ## Install
 
 Apply in order. Read the RBAC section above first, and deploy the guardrail
@@ -204,6 +217,35 @@ well, and leaves the intent in git rather than only in the live object.
 Read the `--- selection ---` block in the log. If it selected nothing, the
 reason is printed per namespace.
 
+## Teardown
+
+Remove in reverse order. The CronJob first, so that no run can start midway
+through the removal:
+
+```bash
+oc delete -f deploy/40-cronjob.yaml
+oc delete -f deploy/30-script-configmap.yaml
+oc delete -f deploy/10-rbac.yaml
+oc delete -f deploy/00-namespace.yaml
+```
+
+Deliberately not in that list: `deploy/20-ledger.yaml`. Deleting the ledger
+discards all coverage history, so every namespace looks untested on the next
+install. Delete it only if that is what you want. Deleting the namespace in the
+last step removes it anyway, so back it up first if the history matters:
+
+```bash
+oc -n k10-restore-test get configmap k10-restore-test-ledger -o yaml > ledger-backup.yaml
+```
+
+Two things the teardown does not clean up, both by design:
+
+- Target namespaces left behind by a failed run, since `KEEP_ON_FAILURE=true`
+  retains them for post-mortem. Find them with
+  `oc get ns -l k10.kasten.io/restore-test=true`.
+- `Released` PersistentVolumes, if the StorageClass reclaim policy is `Retain`.
+  See [docs/sizing.md](docs/sizing.md).
+
 ## Metrics
 
 Pushed to a Pushgateway when `PUSHGATEWAY_URL` is set, and always written to the
@@ -235,6 +277,24 @@ separately.
 which the Pushgateway push depends on. Push failures are logged and non
 blocking, so an absent `curl` degrades to log-only metrics rather than a failed
 run.
+
+## Troubleshooting
+
+The job log is the primary source. Start there:
+
+```bash
+oc -n k10-restore-test logs -l job-name --tail=200
+```
+
+| Symptom | First thing to check |
+|---|---|
+| `nothing selected, exiting` | The `--- selection ---` block names a reason per namespace. Most often no restore point matched `EXPORT_MATCH`, which is open item 1 below. |
+| `eligible namespaces: 0` | In opt-in mode, no namespace carries `k10.kasten.io/restore-test=enabled`, or the namespaces that do hold no restore points. |
+| `<ns>-restored already exists` | Leftover from an earlier failed run retained by `KEEP_ON_FAILURE`. Inspect it, then `oc delete ns <ns>-restored`. |
+| Pods never reach Ready | Read the non-Ready pod dump at the end of the log. Expect `ImagePullBackOff` for applications pulling from another namespace's registry path, and startup failures for anything that needs egress the NetworkPolicy denies. Both are documented in [docs/scope.md](docs/scope.md) as failures that are not the restore's fault. |
+| Namespace stuck `Terminating` | Reported, never force deleted, because stripping finalizers can orphan operator-managed resources. Inspect with `oc get ns <ns> -o jsonpath='{.spec.finalizers}'`. |
+| Every namespace always looks untested | Suspect the ledger lookup. See open item 1's neighbour, unverified item 7 in CLAUDE.md, and check the ledger directly with `oc -n k10-restore-test get configmap k10-restore-test-ledger -o yaml`. |
+| Timeout at `TIMEOUT_SECONDS` | The restore was still running. Either the data does not fit the window or Kasten is serialising the subordinate actions. See [docs/sizing.md](docs/sizing.md). |
 
 ## Repository layout
 
@@ -282,7 +342,8 @@ deployment:
 
    ```bash
    hack/discover-export-artifacts.sh --list
-   hack/discover-export-artifacts.sh --local <ns>/<rp> --exported <ns>/<rp>
+   hack/discover-export-artifacts.sh \
+     --local NAMESPACE/RESTOREPOINT --exported NAMESPACE/RESTOREPOINT
    ```
 
    It dumps the artifacts section for both side by side, reports every JSON path
