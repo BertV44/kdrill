@@ -1,0 +1,29 @@
+# =============================================================================
+# Coverage ledger.
+#
+# One key per source namespace, value is the RFC3339 timestamp of the last
+# successful restore test. Written by the job, read to compute staleness.
+#
+# Last-success timestamps live here rather than as annotations on the source
+# namespaces, so production namespaces are never mutated.
+#
+# This ConfigMap is created empty and is then populated by the job at runtime,
+# with `oc patch --type merge` on individual keys.
+#
+# Operational warnings:
+#   - Deleting this ConfigMap resets all coverage history. Every namespace then
+#     looks untested, which makes the next run treat the whole estate as
+#     maximally overdue.
+#   - Re-applying this file over a populated ledger has not been verified to
+#     preserve existing keys. [unverified] Do not re-apply it as part of a
+#     routine redeploy. Apply it once, at install time.
+#
+# The RBAC that permits writing to it is in 10-rbac.yaml.
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k10-restore-test-ledger
+  namespace: k10-restore-test
+data: {}

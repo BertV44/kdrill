@@ -1,0 +1,13 @@
+# =============================================================================
+# kdrill tool namespace.
+#
+# Apply order: 00-namespace, 10-rbac, 20-ledger, 30-script-configmap, 40-cronjob.
+# See README.md for the required configuration before the first run.
+# =============================================================================
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: k10-restore-test
+  labels:
+    pod-security.kubernetes.io/enforce: restricted

@@ -1,0 +1,550 @@
+# =============================================================================
+# GENERATED FILE. DO NOT EDIT.
+#
+# Produced by hack/build-configmap.sh from src/restore-test.sh.
+# Edit the script, then run: hack/build-configmap.sh
+#
+# src/restore-test.sh sha256: 59a457709ae0c7d807a19123e8aa671ec0bd64cd10a689c07be32fb6e2092ede
+# =============================================================================
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: k10-restore-test-script
+  namespace: k10-restore-test
+  annotations:
+    kdrill.io/generated-by: hack/build-configmap.sh
+    kdrill.io/source-sha256: "59a457709ae0c7d807a19123e8aa671ec0bd64cd10a689c07be32fb6e2092ede"
+data:
+  restore-test.sh: |
+    #!/usr/bin/env bash
+    #
+    # kdrill, automated restore testing for Veeam Kasten.
+    #
+    # Restores exported (S3) restore points into <namespace><suffix> on the same
+    # cluster, validates that workloads reach Ready, then removes the namespaces.
+    #
+    # Target   : Veeam Kasten 9.0.x on OpenShift 4.x
+    # API      : actions.kio.kasten.io/v1alpha1, apps.kio.kasten.io/v1alpha1
+    # Selection: tier-based rotation, least-recently-tested first, budget capped
+    #
+    # This file is the single source of truth. deploy/30-script-configmap.yaml is
+    # generated from it by hack/build-configmap.sh and is never hand-edited.
+    #
+    # Constraint: no heredocs anywhere in this file. It is embedded in a YAML block
+    # scalar, which forces indentation, and bash will not match an indented
+    # terminator. Embedded YAML is emitted line by line with echo.
+
+    set -euo pipefail
+
+    # =====================================================================
+    # Configuration
+    # =====================================================================
+    K10_NS="${K10_NS:-kasten-io}"
+    SELF_NS="${SELF_NS:-k10-restore-test}"
+    SUFFIX="${TARGET_SUFFIX:--restored}"
+    EXPORT_MATCH="${EXPORT_MATCH:?EXPORT_MATCH is required (S3 location profile name)}"
+
+    # Selection
+    SELECTION_MODE="${SELECTION_MODE:-opt-in}"        # opt-in | opt-out
+    INCLUDE_LABEL="${INCLUDE_LABEL:-k10.kasten.io/restore-test=enabled}"
+    EXCLUDE_LABEL="${EXCLUDE_LABEL:-k10.kasten.io/restore-test=excluded}"
+    TIER_LABEL="${TIER_LABEL:-backup-tier}"
+    RP_SELECTION="${RP_SELECTION:-latest}"            # latest | random
+
+    # Cadence targets, in days
+    TIER1_CADENCE="${TIER1_CADENCE_DAYS:-7}"
+    TIER2_CADENCE="${TIER2_CADENCE_DAYS:-30}"
+    TIER3_CADENCE="${TIER3_CADENCE_DAYS:-90}"
+    DEFAULT_CADENCE="${DEFAULT_CADENCE_DAYS:-30}"
+
+    # Budgets
+    MAX_NS="${MAX_NAMESPACES_PER_RUN:-3}"
+    MAX_TOTAL_GIB="${MAX_RESTORE_GIB:-200}"
+    MAX_ONE_GIB="${MAX_NAMESPACE_GIB:-100}"
+
+    # Execution
+    TIMEOUT="${TIMEOUT_SECONDS:-3600}"
+    POLL="${POLL_INTERVAL:-20}"
+    KEEP_ON_FAILURE="${KEEP_ON_FAILURE:-true}"
+    DRY_RUN="${DRY_RUN:-false}"
+    LEDGER="${LEDGER_CONFIGMAP:-k10-restore-test-ledger}"
+
+    # Namespaces never eligible, extended regex
+    SYSTEM_NS_RE="${SYSTEM_NS_REGEX:-^(openshift|kube|default$|kasten-io$|k10-restore-test$)}"
+
+    GIB=$(( 1024 * 1024 * 1024 ))
+    NOW=$(date -u +%s)
+
+    BRA=""
+    RC=0
+    declare -a CREATED_NS=()
+    declare -a SUBJECT_NS=()
+    declare -a SUBJECT_RP=()
+    declare -a POOL_NS=()
+    declare -a POOL_STALE=()
+
+    log()  { printf '%s  %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*"; }
+    warn() { log "WARN: $*"; }
+    fail() { log "ERROR: $*"; RC=1; }
+
+    # =====================================================================
+    # Coverage ledger
+    # =====================================================================
+    ledger_get() {
+      oc -n "$SELF_NS" get configmap "$LEDGER" \
+        -o "jsonpath={.data.$1}" 2>/dev/null || true
+    }
+
+    ledger_set() {
+      oc -n "$SELF_NS" patch configmap "$LEDGER" --type merge \
+        -p "{\"data\":{\"$1\":\"$2\"}}" >/dev/null 2>&1 \
+        || warn "could not update ledger entry for $1"
+    }
+
+    days_since() {
+      # $1 = RFC3339 timestamp, empty means never tested
+      local ref
+      if [ -z "$1" ]; then echo 99999; return; fi
+      ref=$(date -u -d "$1" +%s 2>/dev/null || echo 0)
+      [ "$ref" -eq 0 ] && { echo 99999; return; }
+      echo $(( (NOW - ref) / 86400 ))
+    }
+
+    cadence_for_tier() {
+      case "$1" in
+        1) echo "$TIER1_CADENCE" ;;
+        2) echo "$TIER2_CADENCE" ;;
+        3) echo "$TIER3_CADENCE" ;;
+        *) echo "$DEFAULT_CADENCE" ;;
+      esac
+    }
+
+    ns_has_label() {
+      # $1 = namespace, $2 = label selector
+      [ -n "$(oc get namespace -l "$2" \
+                -o "jsonpath={.items[?(@.metadata.name=='$1')].metadata.name}" \
+                2>/dev/null)" ]
+    }
+
+    # =====================================================================
+    # Stage 1: eligibility
+    # Only namespaces holding at least one restore point are considered.
+    # =====================================================================
+    build_pool() {
+      local ns tier cadence last age overdue
+
+      for ns in $(oc get restorepoints.apps.kio.kasten.io -A \
+                    -o jsonpath='{range .items[*]}{.metadata.namespace}{"\n"}{end}' \
+                    2>/dev/null | sort -u); do
+
+        [[ "$ns" =~ $SYSTEM_NS_RE ]] && continue
+        [[ "$ns" == *"$SUFFIX" ]] && continue
+
+        if [ "$SELECTION_MODE" = "opt-in" ]; then
+          ns_has_label "$ns" "$INCLUDE_LABEL" || continue
+        else
+          ns_has_label "$ns" "$EXCLUDE_LABEL" && continue
+        fi
+
+        tier=$(oc get namespace "$ns" \
+                 -o "jsonpath={.metadata.labels.$TIER_LABEL}" 2>/dev/null || true)
+        cadence=$(cadence_for_tier "${tier:-default}")
+        last=$(ledger_get "$ns")
+        age=$(days_since "$last")
+        overdue=$(( age - cadence ))
+
+        POOL_NS+=("$ns")
+        POOL_STALE+=("$overdue")
+      done
+    }
+
+    # =====================================================================
+    # Stage 2: priority ordering
+    # Descending overdue days. Deterministic, reproducible, auditable.
+    # =====================================================================
+    ordered_pool() {
+      local i
+      for i in "${!POOL_NS[@]}"; do
+        printf '%012d %s\n' "$(( 999999 - POOL_STALE[i] ))" "${POOL_NS[$i]}"
+      done | sort | awk '{print $2}'
+    }
+
+    # =====================================================================
+    # Stage 3: resolve the exported restore point for one namespace
+    #
+    # Local and exported restore points are not distinguished by any
+    # documented label. The discriminator lives in the artifacts exposed by
+    # the details subresource, so EXPORT_MATCH is matched against that
+    # payload. Restore points are walked newest first, so the scan normally
+    # stops on the first candidate.
+    # =====================================================================
+    resolve_exported_rp() {
+      local ns="$1" rp
+      local -a matches=()
+
+      while read -r _ rp; do
+        [ -z "$rp" ] && continue
+        if oc get --raw \
+            "/apis/apps.kio.kasten.io/v1alpha1/namespaces/${ns}/restorepoints/${rp}/details" \
+            2>/dev/null | grep -q -- "${EXPORT_MATCH}"; then
+          matches+=("$rp")
+          [ "$RP_SELECTION" = "latest" ] && break
+        fi
+      done < <(oc -n "$ns" get restorepoints.apps.kio.kasten.io \
+                 -o jsonpath='{range .items[*]}{.status.actionTime}{" "}{.metadata.name}{"\n"}{end}' \
+                 2>/dev/null | sort -r)
+
+      [ "${#matches[@]}" -eq 0 ] && return 1
+
+      if [ "$RP_SELECTION" = "random" ] && [ "${#matches[@]}" -gt 1 ]; then
+        echo "${matches[$(( RANDOM % ${#matches[@]} ))]}"
+      else
+        echo "${matches[0]}"
+      fi
+    }
+
+    rp_size_gib() {
+      local bytes
+      bytes=$(oc -n "$1" get restorepoints.apps.kio.kasten.io "$2" \
+                -o jsonpath='{.status.logicalSizeBytes}' 2>/dev/null || echo 0)
+      [ -z "$bytes" ] && bytes=0
+      echo $(( bytes / GIB ))
+    }
+
+    # =====================================================================
+    # Stage 4: budget enforcement
+    # Walk the priority list and admit namespaces until a budget is reached.
+    # =====================================================================
+    apply_budgets() {
+      local ns rp size total=0
+      log "--- selection ---"
+
+      for ns in $(ordered_pool); do
+        if [ "${#SUBJECT_NS[@]}" -ge "$MAX_NS" ]; then
+          log "namespace budget reached (${MAX_NS}), stopping selection"
+          break
+        fi
+
+        if ! rp=$(resolve_exported_rp "$ns"); then
+          warn "${ns} skipped, no exported restore point matching '${EXPORT_MATCH}'"
+          continue
+        fi
+
+        size=$(rp_size_gib "$ns" "$rp")
+
+        if [ "$size" -gt "$MAX_ONE_GIB" ]; then
+          warn "${ns} skipped, ${size} GiB exceeds the per-namespace budget (${MAX_ONE_GIB} GiB), needs a dedicated run"
+          continue
+        fi
+
+        if [ $(( total + size )) -gt "$MAX_TOTAL_GIB" ]; then
+          log "${ns} deferred, would exceed the aggregate budget (${MAX_TOTAL_GIB} GiB)"
+          continue
+        fi
+
+        total=$(( total + size ))
+        SUBJECT_NS+=("$ns")
+        SUBJECT_RP+=("$rp")
+        log "selected  ${ns}  rp=${rp}  size=${size}GiB  running_total=${total}GiB"
+      done
+
+      log "--- ${#SUBJECT_NS[@]} namespace(s) selected, ${total} GiB total ---"
+    }
+
+    # =====================================================================
+    # Target namespace preparation
+    # Created ahead of the restore so isolation and SCC context are in place
+    # before the first pod starts.
+    # =====================================================================
+    prepare_target_ns() {
+      local src="$1" tgt="$2"
+      local uid_range sup_groups psa_enforce
+
+      uid_range=$(oc get ns "$src" \
+        -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.uid-range}' 2>/dev/null || true)
+      sup_groups=$(oc get ns "$src" \
+        -o jsonpath='{.metadata.annotations.openshift\.io/sa\.scc\.supplemental-groups}' 2>/dev/null || true)
+      psa_enforce=$(oc get ns "$src" \
+        -o jsonpath='{.metadata.labels.pod-security\.kubernetes\.io/enforce}' 2>/dev/null || true)
+
+      {
+        echo "apiVersion: v1"
+        echo "kind: Namespace"
+        echo "metadata:"
+        echo "  name: ${tgt}"
+        echo "  labels:"
+        echo "    k10.kasten.io/restore-test: \"true\""
+        echo "    k10.kasten.io/restore-test-source: \"${src}\""
+        # These are if blocks rather than `[ -n "$x" ] && echo`, deliberately. A
+        # trailing `&&` list whose test fails makes this whole group exit non-zero,
+        # and with `set -o pipefail` that fails the pipeline and kills the script
+        # under `set -e`, after the namespace exists but before the NetworkPolicy is
+        # applied. An `if` whose condition is false exits 0, so the group cannot
+        # fail on an absent optional annotation. Do not condense these back.
+        if [ -n "$psa_enforce" ]; then
+          echo "    pod-security.kubernetes.io/enforce: \"${psa_enforce}\""
+        fi
+        if [ -n "$uid_range" ] || [ -n "$sup_groups" ]; then
+          echo "  annotations:"
+          if [ -n "$uid_range" ]; then
+            echo "    openshift.io/sa.scc.uid-range: \"${uid_range}\""
+          fi
+          if [ -n "$sup_groups" ]; then
+            echo "    openshift.io/sa.scc.supplemental-groups: \"${sup_groups}\""
+          fi
+        fi
+      } | oc create -f - >/dev/null
+
+      CREATED_NS+=("$tgt")
+
+      # Deny all traffic except intra-namespace and DNS. Without the DNS
+      # exception, pods that resolve names at startup never reach Ready,
+      # which would invalidate the success criterion.
+      {
+        echo "apiVersion: networking.k8s.io/v1"
+        echo "kind: NetworkPolicy"
+        echo "metadata:"
+        echo "  name: restore-test-isolation"
+        echo "spec:"
+        echo "  podSelector: {}"
+        echo "  policyTypes: [Ingress, Egress]"
+        echo "  ingress:"
+        echo "    - from:"
+        echo "        - podSelector: {}"
+        echo "  egress:"
+        echo "    - to:"
+        echo "        - podSelector: {}"
+        echo "    - to:"
+        echo "        - namespaceSelector:"
+        echo "            matchLabels:"
+        echo "              kubernetes.io/metadata.name: openshift-dns"
+        echo "      ports:"
+        echo "        - protocol: UDP"
+        echo "          port: 5353"
+        echo "        - protocol: TCP"
+        echo "          port: 5353"
+        echo "        - protocol: UDP"
+        echo "          port: 53"
+        echo "        - protocol: TCP"
+        echo "          port: 53"
+      } | oc -n "$tgt" create -f - >/dev/null
+
+      log "target namespace ${tgt} ready, network isolation applied"
+    }
+
+    build_bra() {
+      local i
+      echo "apiVersion: actions.kio.kasten.io/v1alpha1"
+      echo "kind: BatchRestoreAction"
+      echo "metadata:"
+      echo "  generateName: restoretest-"
+      echo "  namespace: ${K10_NS}"
+      echo "  labels:"
+      echo "    k10.kasten.io/restore-test: \"true\""
+      echo "spec:"
+      echo "  targetNamespaceSuffix: \"${SUFFIX}\""
+      echo "  skipWaitForWorkloadReady: false"
+      echo "  filters:"
+      echo "    excludeResources:"
+      echo "      - group: route.openshift.io"
+      echo "        version: v1"
+      echo "        resource: routes"
+      echo "  subjects:"
+      for i in "${!SUBJECT_NS[@]}"; do
+        echo "    - namespace: ${SUBJECT_NS[$i]}"
+        echo "      restorePointName: ${SUBJECT_RP[$i]}"
+      done
+    }
+
+    cleanup() {
+      local ns deadline phase
+      log "--- cleanup ---"
+
+      for ns in "${CREATED_NS[@]:-}"; do
+        [ -z "$ns" ] && continue
+        log "deleting namespace ${ns}"
+        oc delete namespace "$ns" --wait=false --ignore-not-found >/dev/null 2>&1 || true
+      done
+
+      # Namespaces stuck in Terminating are reported, never force deleted.
+      # Removing finalizers blindly can orphan operator-managed resources.
+      deadline=$(( $(date +%s) + 300 ))
+      for ns in "${CREATED_NS[@]:-}"; do
+        [ -z "$ns" ] && continue
+        while oc get namespace "$ns" >/dev/null 2>&1; do
+          if [ "$(date +%s)" -ge "$deadline" ]; then
+            phase=$(oc get namespace "$ns" -o jsonpath='{.status.phase}' 2>/dev/null || echo "unknown")
+            fail "namespace ${ns} still present after 300s (phase=${phase}), inspect finalizers"
+            break
+          fi
+          sleep 10
+        done
+      done
+
+      if [ -n "$BRA" ]; then
+        oc -n "$K10_NS" delete batchrestoreaction "$BRA" --ignore-not-found >/dev/null 2>&1 || true
+      fi
+    }
+
+    metrics_body() {
+      # $1 selected, $2 succeeded, $3 failed, $4 untested, $5 max staleness
+      printf 'k10_restore_test_eligible_namespaces %s\n' "${#POOL_NS[@]}"
+      printf 'k10_restore_test_selected_namespaces %s\n' "$1"
+      printf 'k10_restore_test_succeeded_namespaces %s\n' "$2"
+      printf 'k10_restore_test_failed_namespaces %s\n' "$3"
+      printf 'k10_restore_test_untested_namespaces %s\n' "$4"
+      printf 'k10_restore_test_max_staleness_days %s\n' "$5"
+      printf 'k10_restore_test_last_run_timestamp %s\n' "$NOW"
+    }
+
+    emit_metrics() {
+      local selected="$1" succeeded="$2" failed="$3"
+      local ns age last max_stale=0 untested=0
+
+      for ns in "${POOL_NS[@]:-}"; do
+        [ -z "$ns" ] && continue
+        last=$(ledger_get "$ns")
+        if [ -z "$last" ]; then
+          untested=$(( untested + 1 ))
+          continue
+        fi
+        age=$(days_since "$last")
+        [ "$age" -gt "$max_stale" ] && max_stale="$age"
+      done
+
+      log "--- coverage ---"
+      metrics_body "$selected" "$succeeded" "$failed" "$untested" "$max_stale" \
+        | while read -r line; do log "$line"; done
+
+      if [ -n "${PUSHGATEWAY_URL:-}" ]; then
+        metrics_body "$selected" "$succeeded" "$failed" "$untested" "$max_stale" \
+          | curl -sf --data-binary @- \
+              "${PUSHGATEWAY_URL}/metrics/job/k10_restore_test" >/dev/null \
+          || warn "metrics push failed, non blocking"
+      fi
+    }
+
+    # =====================================================================
+    # Main
+    # =====================================================================
+    log "=== Veeam Kasten restore test ==="
+    log "selection mode: ${SELECTION_MODE}, restore point selection: ${RP_SELECTION}"
+    log "budgets: ${MAX_NS} namespaces, ${MAX_TOTAL_GIB} GiB total, ${MAX_ONE_GIB} GiB per namespace"
+
+    build_pool
+    log "eligible namespaces: ${#POOL_NS[@]}"
+    apply_budgets
+
+    if [ "${#SUBJECT_NS[@]}" -eq 0 ]; then
+      log "nothing selected, exiting"
+      emit_metrics 0 0 0
+      exit 0
+    fi
+
+    if [ "$DRY_RUN" = "true" ]; then
+      log "DRY_RUN enabled, no restore performed"
+      emit_metrics "${#SUBJECT_NS[@]}" 0 0
+      exit 0
+    fi
+
+    # Stage the target namespaces, dropping any that cannot be prepared
+    declare -a STAGED_NS=()
+    declare -a STAGED_RP=()
+    for i in "${!SUBJECT_NS[@]}"; do
+      src="${SUBJECT_NS[$i]}"
+      tgt="${src}${SUFFIX}"
+
+      if [ ${#tgt} -gt 63 ]; then
+        fail "${tgt} exceeds 63 characters (RFC 1123), skipped"
+        continue
+      fi
+      if oc get namespace "$tgt" >/dev/null 2>&1; then
+        fail "${tgt} already exists, leftover from a previous run, skipped"
+        continue
+      fi
+
+      prepare_target_ns "$src" "$tgt"
+      STAGED_NS+=("$src")
+      STAGED_RP+=("${SUBJECT_RP[$i]}")
+    done
+
+    if [ "${#STAGED_NS[@]}" -eq 0 ]; then
+      fail "no namespace could be staged"
+      cleanup
+      exit 1
+    fi
+
+    SUBJECT_NS=("${STAGED_NS[@]}")
+    SUBJECT_RP=("${STAGED_RP[@]}")
+
+    BRA=$(build_bra | oc create -f - -o jsonpath='{.metadata.name}')
+    log "BatchRestoreAction created: ${BRA}"
+
+    # The batch reaches Complete only when every subordinate action succeeds,
+    # workload readiness included.
+    deadline=$(( $(date +%s) + TIMEOUT ))
+    while :; do
+      state=$(oc -n "$K10_NS" get batchrestoreaction "$BRA" \
+                -o jsonpath='{.status.state}' 2>/dev/null || echo "")
+      pct=$(oc -n "$K10_NS" get batchrestoreaction "$BRA" \
+                -o jsonpath='{.status.progress}' 2>/dev/null || echo "0")
+
+      case "$state" in
+        Complete) log "state=Complete (${pct}%)"; break ;;
+        Failed)   fail "state=Failed (${pct}%)"; break ;;
+        *)        log "state=${state:-Pending} (${pct}%)" ;;
+      esac
+
+      if [ "$(date +%s)" -ge "$deadline" ]; then
+        fail "timed out after ${TIMEOUT}s (last state: ${state:-unknown})"
+        break
+      fi
+      sleep "$POLL"
+    done
+
+    # Per-namespace outcome, ledger updated on success only
+    log "--- subordinate actions ---"
+    succeeded=0
+    failed=0
+    while read -r ans astate; do
+      [ -z "$ans" ] && continue
+      src="${ans%"$SUFFIX"}"
+      if [ "$astate" = "Complete" ]; then
+        succeeded=$(( succeeded + 1 ))
+        ledger_set "$src" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+        log "PASS  ${src}"
+      else
+        failed=$(( failed + 1 ))
+        log "FAIL  ${src} (state=${astate:-unknown})"
+      fi
+    done < <(oc get restoreactions.actions.kio.kasten.io -A \
+               -l "k10.kasten.io/batchRestoreActionName=${BRA}" \
+               -o jsonpath='{range .items[*]}{.metadata.namespace}{" "}{.status.state}{"\n"}{end}' \
+               2>/dev/null)
+
+    if [ "$failed" -gt 0 ]; then
+      RC=1
+    fi
+
+    if [ "$RC" -ne 0 ]; then
+      for ns in "${CREATED_NS[@]:-}"; do
+        [ -z "$ns" ] && continue
+        log "--- pods not Ready in ${ns} ---"
+        oc -n "$ns" get pods \
+          --field-selector=status.phase!=Running,status.phase!=Succeeded \
+          -o wide 2>/dev/null || true
+      done
+    fi
+
+    emit_metrics "${#SUBJECT_NS[@]}" "$succeeded" "$failed"
+
+    if [ "$RC" -ne 0 ] && [ "$KEEP_ON_FAILURE" = "true" ]; then
+      log "failure detected, namespaces retained for analysis: ${CREATED_NS[*]:-}"
+      log "manual cleanup: oc delete ns ${CREATED_NS[*]:-}"
+      exit 1
+    fi
+
+    cleanup
+    log "=== finished (rc=${RC}) ==="
+    exit "$RC"

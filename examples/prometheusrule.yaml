@@ -1,0 +1,207 @@
+# =============================================================================
+# Alerting rules for kdrill.
+#
+# Design rule, from CLAUDE.md: the alerting signal is staleness and untested
+# count, NOT pass rate. A 100 percent pass rate across zero selected namespaces
+# is the silent failure mode this tool must not have, and a ratio alert cannot
+# see it. Every rule below is therefore an absolute count, a timestamp age, or
+# an absence check.
+#
+# Prerequisites, none of which this repository installs:
+#   1. PUSHGATEWAY_URL set in deploy/40-cronjob.yaml, so metrics are pushed.
+#   2. A Prometheus that scrapes that Pushgateway.
+#   3. On OpenShift, user workload monitoring enabled if you apply this into a
+#      user namespace. [unverified] against a specific OpenShift 4.x minor.
+#
+# Label caveat: pushing to /metrics/job/k10_restore_test gives the series a
+# job="k10_restore_test" label. Any further labels, including namespace, come
+# from your Pushgateway scrape configuration and honor_labels setting, not from
+# this tool. Adjust the selectors below if your scrape config differs.
+# [unverified] for your specific monitoring stack.
+#
+# Metric names are the contract in CLAUDE.md. Changing them is a breaking
+# change for these rules.
+# =============================================================================
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: k10-restore-test
+  namespace: k10-restore-test
+  labels:
+    role: alert-rules
+spec:
+  groups:
+    - name: kdrill.coverage
+      # The job runs daily, so the underlying data changes at most once a day.
+      # A slow evaluation interval avoids pretending to more resolution than
+      # the data has.
+      interval: 5m
+      rules:
+
+        # -------------------------------------------------------------------
+        # The tool itself stopped reporting.
+        #
+        # These two come first because every rule after them is only
+        # trustworthy if the pipeline is alive. Pushgateway retains the last
+        # push indefinitely, so a missing series means nothing ever pushed, or
+        # the gateway was reset, rather than a transient scrape gap.
+        # -------------------------------------------------------------------
+        - alert: KdrillNoMetricsAtAll
+          expr: absent(k10_restore_test_last_run_timestamp{job="k10_restore_test"})
+          for: 1h
+          labels:
+            severity: warning
+            service: kdrill
+          annotations:
+            summary: "kdrill has never reported metrics"
+            description: >-
+              No k10_restore_test_last_run_timestamp series exists. Either the
+              CronJob has never completed a run, PUSHGATEWAY_URL is unset or
+              wrong, or the Pushgateway was restarted without persistence.
+              Restore testing coverage is currently unknown, which is not the
+              same as healthy.
+
+        - alert: KdrillRunStale
+          # The CronJob schedule is daily. 36h tolerates one missed run plus
+          # the activeDeadlineSeconds window, and fires on the second miss.
+          expr: time() - k10_restore_test_last_run_timestamp{job="k10_restore_test"} > 36 * 3600
+          for: 30m
+          labels:
+            severity: warning
+            service: kdrill
+          annotations:
+            summary: "kdrill has not completed a run in over 36 hours"
+            description: >-
+              Last successful metrics push was
+              {{ $value | humanizeDuration }} ago. Expected at least one run
+              per day. Check the CronJob in namespace k10-restore-test, its
+              most recent Job, and concurrencyPolicy Forbid blocking on a
+              previous run that never finished.
+
+        # -------------------------------------------------------------------
+        # The silent failure mode CLAUDE.md names explicitly.
+        #
+        # The tool runs, exits zero, reports a perfect pass rate, and tests
+        # nothing. Both shapes of that are covered: nothing eligible at all,
+        # and eligible namespaces that never get selected.
+        # -------------------------------------------------------------------
+        - alert: KdrillNothingEligible
+          expr: k10_restore_test_eligible_namespaces{job="k10_restore_test"} == 0
+          for: 2h
+          labels:
+            severity: critical
+            service: kdrill
+          annotations:
+            summary: "kdrill considers zero namespaces eligible"
+            description: >-
+              The run completed but the eligible pool was empty, so no restore
+              was even attempted. In opt-in mode this usually means the
+              INCLUDE_LABEL is not applied to any namespace holding a restore
+              point. This alert exists because the run still exits zero and
+              still reports a 100 percent pass rate.
+
+        - alert: KdrillNothingSelected
+          expr: |
+            k10_restore_test_eligible_namespaces{job="k10_restore_test"} > 0
+              and
+            k10_restore_test_selected_namespaces{job="k10_restore_test"} == 0
+          for: 2h
+          labels:
+            severity: critical
+            service: kdrill
+          annotations:
+            summary: "kdrill found eligible namespaces but selected none"
+            description: >-
+              {{ with query "k10_restore_test_eligible_namespaces" }}{{ . | first | value }}{{ end }}
+              namespaces were eligible and none were selected. Likely causes,
+              in the order worth checking: no restore point matched
+              EXPORT_MATCH, which is known unverified item 1 in CLAUDE.md;
+              every candidate exceeded MAX_NAMESPACE_GIB; or the aggregate
+              MAX_RESTORE_GIB budget admitted nothing. Read the job log, the
+              selection stage names the reason per namespace.
+
+        # -------------------------------------------------------------------
+        # Untested count.
+        #
+        # Note on the metric's meaning: never-tested namespaces are counted
+        # here and are deliberately EXCLUDED from
+        # k10_restore_test_max_staleness_days, which only takes the maximum
+        # over namespaces that have a ledger entry. Staleness can therefore look
+        # healthy while namespaces have never been tested once. That is why
+        # this alert is separate and not folded into the staleness rule.
+        # -------------------------------------------------------------------
+        - alert: KdrillNamespacesNeverTested
+          expr: k10_restore_test_untested_namespaces{job="k10_restore_test"} > 0
+          for: 24h
+          labels:
+            severity: warning
+            service: kdrill
+          annotations:
+            summary: "{{ $value }} namespace(s) have never had a restore test"
+            description: >-
+              These namespaces are eligible and have no entry in the coverage
+              ledger, so their restore path has never been exercised. If this
+              persists, the rotation is not reaching them: compare the eligible
+              count against MAX_NAMESPACES_PER_RUN and the cadence targets. A
+              pool larger than the daily budget multiplied by the cadence can
+              never fully converge.
+
+        # -------------------------------------------------------------------
+        # Staleness.
+        #
+        # This is a single aggregate maximum across the whole pool, so the
+        # threshold has to be the loosest cadence in use. With the shipped
+        # defaults that is TIER3_CADENCE_DAYS=90. Per-tier alerting would need
+        # per-tier metrics, which the contract in CLAUDE.md does not expose.
+        # Lower this to match your own loosest cadence.
+        # -------------------------------------------------------------------
+        - alert: KdrillCoverageStale
+          expr: k10_restore_test_max_staleness_days{job="k10_restore_test"} > 100
+          for: 1h
+          labels:
+            severity: warning
+            service: kdrill
+          annotations:
+            summary: "Least recently tested namespace is {{ $value }} days old"
+            description: >-
+              The worst-case namespace has not passed a restore test in
+              {{ $value }} days, beyond the 90 day tier-3 cadence plus grace.
+              Threshold assumes the shipped cadence defaults. If your loosest
+              cadence is tighter, lower it here.
+
+        - alert: KdrillCoverageSeverelyStale
+          expr: k10_restore_test_max_staleness_days{job="k10_restore_test"} > 180
+          for: 1h
+          labels:
+            severity: critical
+            service: kdrill
+          annotations:
+            summary: "Least recently tested namespace is {{ $value }} days old"
+            description: >-
+              Twice the loosest cadence has elapsed for at least one namespace.
+              Treat the restore coverage claim for that application as expired.
+
+        # -------------------------------------------------------------------
+        # Failures.
+        #
+        # An absolute count, deliberately not a pass rate, for the reason at
+        # the top of this file. A restore test that fails is the signal this
+        # tool exists to produce, so it is surfaced. If you want the strict
+        # CLAUDE.md reading, staleness and untested count only, delete this
+        # rule: the alerts above do not depend on it.
+        # -------------------------------------------------------------------
+        - alert: KdrillRestoreTestFailed
+          expr: k10_restore_test_failed_namespaces{job="k10_restore_test"} > 0
+          labels:
+            severity: critical
+            service: kdrill
+          annotations:
+            summary: "{{ $value }} namespace(s) failed their restore test"
+            description: >-
+              At least one namespace did not reach workload Ready after being
+              restored from its exported restore point. With
+              KEEP_ON_FAILURE=true the target namespaces were retained for
+              post-mortem, and the job log lists the pods that never became
+              Ready. Note that backoffLimit is 0 by design, so there is no
+              automatic retry masking this.

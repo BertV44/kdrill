@@ -1,0 +1,121 @@
+# =============================================================================
+# kdrill scheduled run.
+#
+# Before the first run:
+#   1. Set EXPORT_MATCH to the name of the S3 location profile.
+#   2. Label source namespaces with backup-tier and the opt-in label.
+#   3. Run once with DRY_RUN=true and read the selection out of the job log.
+#
+# Every value below is also the script default. The environment block is the
+# supported way to change behaviour; the script itself is not edited.
+# =============================================================================
+---
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: k10-restore-test
+  namespace: k10-restore-test
+spec:
+  # Daily with a small batch is usually preferable to weekly with a large one:
+  # the same coverage at a fraction of the peak load on storage and data movers.
+  schedule: "0 3 * * *"
+  timeZone: "Europe/Paris"
+  concurrencyPolicy: Forbid
+  successfulJobsHistoryLimit: 7
+  failedJobsHistoryLimit: 7
+  startingDeadlineSeconds: 600
+  jobTemplate:
+    spec:
+      # No automatic retry. A failed restore test is a signal to investigate,
+      # not something to paper over with a rerun.
+      backoffLimit: 0
+      # Must exceed TIMEOUT_SECONDS plus cleanup time.
+      activeDeadlineSeconds: 4200
+      template:
+        spec:
+          serviceAccountName: k10-restore-test
+          restartPolicy: Never
+          securityContext:
+            runAsNonRoot: true
+            seccompProfile:
+              type: RuntimeDefault
+          containers:
+            - name: restore-test
+              image: registry.redhat.io/openshift4/ose-cli:latest
+              command: ["/bin/bash", "/scripts/restore-test.sh"]
+              env:
+                # --- required ---
+                - name: EXPORT_MATCH
+                  value: "CHANGEME-s3-location-profile-name"
+                - name: SELF_NS
+                  valueFrom:
+                    fieldRef:
+                      fieldPath: metadata.namespace
+
+                # --- selection ---
+                - name: SELECTION_MODE
+                  value: "opt-in"
+                - name: INCLUDE_LABEL
+                  value: "k10.kasten.io/restore-test=enabled"
+                - name: TIER_LABEL
+                  value: "backup-tier"
+                - name: RP_SELECTION
+                  value: "latest"
+
+                # --- cadence targets, days ---
+                - name: TIER1_CADENCE_DAYS
+                  value: "7"
+                - name: TIER2_CADENCE_DAYS
+                  value: "30"
+                - name: TIER3_CADENCE_DAYS
+                  value: "90"
+                - name: DEFAULT_CADENCE_DAYS
+                  value: "30"
+
+                # --- budgets ---
+                - name: MAX_NAMESPACES_PER_RUN
+                  value: "2"
+                - name: MAX_RESTORE_GIB
+                  value: "200"
+                - name: MAX_NAMESPACE_GIB
+                  value: "100"
+
+                # --- execution ---
+                - name: K10_NS
+                  value: "kasten-io"
+                - name: TARGET_SUFFIX
+                  value: "-restored"
+                - name: TIMEOUT_SECONDS
+                  value: "3600"
+                - name: POLL_INTERVAL
+                  value: "20"
+                - name: KEEP_ON_FAILURE
+                  value: "true"
+                - name: DRY_RUN
+                  value: "false"
+                # Requires curl in the image. [unverified] for
+                # registry.redhat.io/openshift4/ose-cli. Metric push failures
+                # are logged and non blocking.
+                # - name: PUSHGATEWAY_URL
+                #   value: "http://pushgateway.monitoring.svc:9091"
+              volumeMounts:
+                - name: script
+                  mountPath: /scripts
+                  readOnly: true
+              resources:
+                requests:
+                  cpu: 50m
+                  memory: 128Mi
+                limits:
+                  cpu: 500m
+                  memory: 512Mi
+              securityContext:
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities:
+                  drop: ["ALL"]
+          volumes:
+            - name: script
+              configMap:
+                name: k10-restore-test-script
+                defaultMode: 0555

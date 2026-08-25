@@ -1,0 +1,139 @@
+# =============================================================================
+# Guardrail for the cluster-wide namespace delete permission.
+#
+# WHY THIS EXISTS
+#
+# deploy/10-rbac.yaml grants the k10-restore-test ServiceAccount "delete" on
+# namespaces cluster-wide. That is not a design preference, it is a Kubernetes
+# RBAC limitation: RBAC authorises verbs on resource types, and cannot restrict
+# deletion to names matching a pattern such as *-restored. There is no narrower
+# RBAC grant that still lets the tool clean up after itself.
+#
+# The mitigation is admission control. This policy denies that ServiceAccount
+# the deletion of any namespace that does not carry
+# k10.kasten.io/restore-test=true, a label the tool sets on the namespaces it
+# creates and that nothing else should carry.
+#
+# Deploy this, or an equivalent ValidatingAdmissionPolicy, BEFORE deploying the
+# CronJob. Not applied by deploy/, because it depends on an admission
+# controller this repository does not install and does not assume.
+#
+# STATUS: partially verified
+#
+# Verified against the Kyverno CLI 1.18.1, offline, no cluster involved:
+#   - The policy schema is accepted, including validate.failureAction and the
+#     resources / subjects sibling structure under match.any.
+#   - The pattern logic is correct. With the operation filter switched to CREATE
+#     and the subjects matcher removed, so that the CLI can evaluate it, an
+#     unlabelled Namespace FAILS with the intended message at path
+#     /metadata/labels/k10.kasten.io/restore-test/, and a Namespace carrying
+#     k10.kasten.io/restore-test=true PASSES.
+#
+# Still [unverified], and both need a live cluster. A guardrail that silently
+# does not match is worse than no guardrail, because it produces false
+# confidence:
+#
+#   1. Whether Kyverno evaluates a validate.pattern against the EXISTING object
+#      on a DELETE admission request. The CLI cannot simulate DELETE admission:
+#      with operations: [DELETE] it evaluated zero rules against a Namespace.
+#      This is the load bearing assumption of the whole policy.
+#   2. Whether the subjects matcher actually matches the ServiceAccount at
+#      admission time. The CLI has no requesting subject, so it could not be
+#      exercised offline.
+#
+# Verify both with the procedure at the end of this file before trusting it.
+#
+# Target: Kyverno on OpenShift 4.x. Check against your deployed Kyverno version.
+# =============================================================================
+---
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: restrict-restore-test-ns-deletion
+  annotations:
+    policies.kyverno.io/title: Restrict kdrill namespace deletion
+    policies.kyverno.io/category: Security
+    policies.kyverno.io/severity: high
+    policies.kyverno.io/subject: Namespace
+    policies.kyverno.io/description: >-
+      The kdrill ServiceAccount holds cluster-wide delete on namespaces because
+      RBAC cannot scope deletion by name. This policy confines that permission
+      to namespaces labelled k10.kasten.io/restore-test=true.
+spec:
+  # Admission-time only. A background scan has no requesting subject, so
+  # subject matching cannot apply and the policy would be meaningless there.
+  background: false
+  rules:
+    - name: only-restore-test-namespaces
+      match:
+        any:
+          # `resources` and `subjects` are siblings. Both must match: a
+          # Namespace DELETE, requested by this specific ServiceAccount. Other
+          # subjects, including cluster administrators, are unaffected by this
+          # policy.
+          - resources:
+              kinds:
+                - Namespace
+              operations:
+                - DELETE
+            subjects:
+              - kind: ServiceAccount
+                name: k10-restore-test
+                namespace: k10-restore-test
+      validate:
+        failureAction: Enforce
+        message: >-
+          The k10-restore-test ServiceAccount may only delete namespaces
+          labelled k10.kasten.io/restore-test=true. This namespace is not one
+          of kdrill's disposable restore targets, so the deletion was denied.
+        pattern:
+          metadata:
+            labels:
+              k10.kasten.io/restore-test: "true"
+
+# =============================================================================
+# HOW TO VERIFY IT ACTUALLY WORKS
+#
+# Do this on a lab cluster. It is the only way to settle the two unverified
+# points above. Both cases must behave as stated, and the negative case is the
+# one that matters.
+#
+#   # 1. Apply the policy, then confirm Kyverno accepted the schema.
+#   oc apply -f examples/kyverno-ns-delete-guardrail.yaml
+#   oc get clusterpolicy restrict-restore-test-ns-deletion -o yaml
+#
+#   # 2. NEGATIVE CASE: an unlabelled namespace must NOT be deletable.
+#   oc create namespace kdrill-guardrail-probe
+#   oc --as=system:serviceaccount:k10-restore-test:k10-restore-test \
+#      delete namespace kdrill-guardrail-probe
+#   # Expected: denied by admission, quoting the message above.
+#   # If it succeeds, the guardrail is not working. Stop and fix it before
+#   # running kdrill, because at that point the ServiceAccount can delete any
+#   # namespace on the cluster.
+#
+#   # 3. POSITIVE CASE: a correctly labelled namespace must remain deletable,
+#   #    otherwise kdrill can never clean up and every run leaks namespaces.
+#   oc label namespace kdrill-guardrail-probe k10.kasten.io/restore-test=true
+#   oc --as=system:serviceaccount:k10-restore-test:k10-restore-test \
+#      delete namespace kdrill-guardrail-probe
+#   # Expected: deleted.
+#
+# Note that step 2 leaves a namespace behind on purpose if the guardrail works.
+# Remove it as an administrator:
+#   oc delete namespace kdrill-guardrail-probe --ignore-not-found
+#
+# OLDER KYVERNO
+#
+# If your Kyverno rejects validate.failureAction, move the enforcement mode up
+# to the spec and drop it from the rule:
+#
+#   spec:
+#     validationFailureAction: Enforce
+#     background: false
+#     rules:
+#       - name: only-restore-test-namespaces
+#         ...
+#
+# Record which form your cluster accepted, and the outcome of steps 2 and 3,
+# next to the RBAC note in README.md.
+# =============================================================================

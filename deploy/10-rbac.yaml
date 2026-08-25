@@ -1,0 +1,143 @@
+# =============================================================================
+# All kdrill permissions, in one file so that a reviewer can audit the full
+# grant without reading the rest of the deployment.
+#
+# Three scopes:
+#   - cluster-wide  : namespace lifecycle, restore point reads, diagnostics
+#   - kasten-io     : BatchRestoreAction, which can only be created there
+#   - k10-restore-test : the coverage ledger
+#
+# Read the WARNING on the ClusterRole before applying this on a cluster you
+# care about.
+# =============================================================================
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: k10-restore-test
+  namespace: k10-restore-test
+
+---
+# -----------------------------------------------------------------------------
+# Cluster-scoped permissions.
+#
+# WARNING: "delete namespaces" is cluster-wide here. Kubernetes RBAC cannot
+# restrict deletion by name pattern, so this grant cannot be narrowed to the
+# <namespace>-restored namespaces the tool actually creates. It is a genuine
+# cluster-wide namespace delete permission held by a ServiceAccount driven by a
+# CronJob.
+#
+# The mitigation is an admission policy that denies this ServiceAccount the
+# deletion of any namespace not carrying k10.kasten.io/restore-test=true. A
+# Kyverno example is provided in examples/kyverno-ns-delete-guardrail.yaml.
+# Deploy the guardrail, or an equivalent ValidatingAdmissionPolicy, before
+# deploying the CronJob.
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: k10-restore-test
+rules:
+  # Manage test namespaces
+  - apiGroups: [""]
+    resources: ["namespaces"]
+    verbs: ["get", "list", "create", "delete", "patch"]
+
+  # Network isolation for test namespaces
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["networkpolicies"]
+    verbs: ["get", "create", "delete"]
+
+  # Read source restore points and their artifacts
+  - apiGroups: ["apps.kio.kasten.io"]
+    resources: ["restorepoints", "restorepoints/details"]
+    verbs: ["get", "list"]
+
+  # Subordinate RestoreActions are created in the target namespaces,
+  # which vary from run to run
+  - apiGroups: ["actions.kio.kasten.io"]
+    resources: ["restoreactions", "restoreactions/details"]
+    verbs: ["get", "list", "create", "delete"]
+
+  # Failure diagnostics
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: k10-restore-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: k10-restore-test
+subjects:
+  - kind: ServiceAccount
+    name: k10-restore-test
+    namespace: k10-restore-test
+
+---
+# -----------------------------------------------------------------------------
+# Permissions in the Veeam Kasten namespace.
+# BatchRestoreAction can only be created there, per the documented API contract.
+# [verified] docs.kasten.io 9.0.3.
+#
+# If Kasten is installed somewhere other than kasten-io, change the namespace
+# here and set K10_NS in 40-cronjob.yaml to match.
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k10-restore-test
+  namespace: kasten-io
+rules:
+  - apiGroups: ["actions.kio.kasten.io"]
+    resources: ["batchrestoreactions", "batchrestoreactions/details"]
+    verbs: ["get", "list", "create", "delete"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k10-restore-test
+  namespace: kasten-io
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k10-restore-test
+subjects:
+  - kind: ServiceAccount
+    name: k10-restore-test
+    namespace: k10-restore-test
+
+---
+# -----------------------------------------------------------------------------
+# Coverage ledger permissions, scoped to the tool namespace only.
+# The ledger ConfigMap itself is in 20-ledger.yaml.
+# -----------------------------------------------------------------------------
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: k10-restore-test-ledger
+  namespace: k10-restore-test
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "patch", "update"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: k10-restore-test-ledger
+  namespace: k10-restore-test
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: k10-restore-test-ledger
+subjects:
+  - kind: ServiceAccount
+    name: k10-restore-test
+    namespace: k10-restore-test
