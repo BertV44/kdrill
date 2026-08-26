@@ -117,13 +117,16 @@ different version.
   the policy that produced them names an export profile in its own spec.
   `[verified]` on Kasten 9.0.4, OpenShift 4.20.30, 2026-08-26. This is the
   discriminator, and it supersedes the earlier statement that no such label
-  existed. `exportType` was `appConfigOnly` for every exported restore point on
-  the reference cluster, because those namespaces hold no PVCs. The value for a
-  restore point exported with volume data is `[unverified]`.
-- `.status.logicalSizeBytes` **can be absent**. It was empty on every
-  namespace-scoped restore point on the reference cluster, so `rp_size_gib`
-  returns 0 and the GiB budgets do not bite. Do not assume the budgets are
-  protecting you without checking that the field is populated.
+  existed. `exportType` is `appConfigOnly` when the namespace holds no PVC and
+  `portableAppData` when volume data is exported. `[verified]` on 9.0.4, both
+  values observed on the reference cluster.
+- `.status.logicalSizeBytes` and `.status.physicalSizeBytes` are populated on
+  **local** restore points and **absent on exported** ones. Measured on 9.0.4: a
+  1 GiB volume gave a local restore point reporting `1073741824` for both fields
+  and an exported restore point with neither field present. Since kdrill selects
+  exported restore points, `rp_size_gib` returns 0 for every selection and the
+  GiB budgets are inert. `MAX_NAMESPACES_PER_RUN` is the only cap that reliably
+  bites. The script warns when a selected restore point reports no size.
 - `RestoreAction.spec.targetNamespace` is documented as being removed; the target
   is `metadata.namespace`.
 - `ValidateAction` validates exported restore points in filesystem mode, with
@@ -151,11 +154,20 @@ These are the open risks. Do not silently resolve them by guessing.
    set to the profile name. kdrill would have restored local snapshots while
    reporting that it had tested the export path. Do not go back to payload
    matching. `restorepoints/details` was removed from the RBAC as a result.
-2. **Kasten concurrency limiter settings for 9.0.x.** `[unverified]` The Helm keys
-   governing parallel volume restore operations were not confirmed. Verify before
-   documenting any guidance on raising `MAX_NAMESPACES_PER_RUN`.
-3. **`curl` availability in `registry.redhat.io/openshift4/ose-cli`.** `[unverified]`
-   Only relevant when `PUSHGATEWAY_URL` is set.
+2. **RESOLVED 2026-08-26. Kasten concurrency limiters.** They live in the
+   `k10-config` ConfigMap in the Kasten namespace, mirrored as environment
+   variables on `executor-svc`. Defaults observed on 9.0.4:
+   `K10LimiterVolumeRestoresPerCluster=10`,
+   `K10LimiterVolumeRestoresPerAction=3`,
+   `K10LimiterWorkloadRestoresPerAction=3`,
+   `K10LimiterCsiSnapshotRestoresPerAction=3`, `K10LimiterExecutorThreads=8`.
+   Since kdrill creates one subordinate RestoreAction per namespace, the
+   per-action limits apply per namespace and the per-cluster limit is the real
+   ceiling. Guidance is now in docs/sizing.md.
+3. **RESOLVED 2026-08-26. `curl` in `registry.redhat.io/openshift4/ose-cli`.**
+   Present at `/usr/bin/curl`. `wget`, `python3` and `bash` are there too.
+   Verified by running the image on the reference cluster. The Pushgateway push
+   works.
 4. **Cross-namespace image pull.** `[unverified]` Applications pulling from the
    internal OpenShift registry with a `<source-ns>/<image>` reference will hit
    ImagePullBackOff in the restored namespace, because its ServiceAccounts lack
@@ -192,20 +204,22 @@ These are the open risks. Do not silently resolve them by guessing.
    behaviour of a duplicate Ingress host on a specific controller remains
    `[unverified]`, but it no longer matters, because the object is filtered out
    before it can be created.
-11. **PARTLY RESOLVED 2026-08-26. End-to-end restore.** A full cycle ran to
-   success in-cluster, as a Job using the real ServiceAccount, image and mounted
-   ConfigMap: 1 namespace eligible, the exported restore point selected, target
-   namespace created with network isolation, BatchRestoreAction Pending then
-   Complete at 100 percent, `PASS kdrill-demo`, ledger written, target namespace
-   deleted through the guardrail, BatchRestoreAction cleaned up, source namespace
-   untouched, `rc=0`. Total elapsed 79 seconds.
-   **Still not proven: volume restore.** The test application was switched to
-   `emptyDir` because the lab has no VolumeSnapshotClass carrying
-   `k10.kasten.io/is-snapshot-class: "true"`, so `exportType` was
-   `appConfigOnly` and no PersistentVolume was provisioned or attached. The
-   headline claim in the scope statement, that volumes provision and attach from
-   exported data, is therefore still `[unverified]`. Re-run with a PVC once a
-   snapshot class is annotated.
+11. **RESOLVED 2026-08-26. End-to-end restore, volumes included.** Two runs.
+   Automated: kdrill as an in-cluster Job with the real ServiceAccount, image and
+   mounted ConfigMap, restoring a namespace holding a 1 GiB PVC. 96 seconds,
+   BatchRestoreAction Pending to Complete at 100 percent, `PASS kdrill-demo`,
+   PVC Bound to a fresh PV in the target namespace with the pod Running, ledger
+   written, target namespace deleted through the guardrail, no Released PV left
+   behind, `rc=0`.
+   Manual, to check what kdrill itself does not: a 32893 byte file written to the
+   volume and never touched by the container came back with an **identical
+   sha256** after snapshot, export to Storj S3 and restore into a new namespace.
+   So the data survives the round trip, which is more than the scope statement
+   claims. Do not promote that into the scope statement: one file is not data
+   correctness, and kdrill still verifies nothing about content.
+   Note on methodology, worth remembering: the first attempt appeared to show
+   data loss. The cause was the test application overwriting its own payload on
+   boot. A verification payload must live in a file the workload never writes.
 12. **Volume backup prerequisite, discovered 2026-08-26.** `[verified]` Kasten
    cannot snapshot a PVC unless some VolumeSnapshotClass carries the annotation
    `k10.kasten.io/is-snapshot-class: "true"`. Without it a backup of a namespace

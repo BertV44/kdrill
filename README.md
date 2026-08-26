@@ -127,13 +127,17 @@ Verified on a live cluster, OpenShift 4.20.30 / Kubernetes 1.33.13, Kasten 9.0.4
   BatchRestoreAction Complete at 100 percent, `PASS`, ledger written, target
   namespace deleted through the guardrail, source namespace untouched, `rc=0`
 
-**One thing in the scope statement is still not proven: volume restore.** That run
-used an application with no PersistentVolumeClaim, because the reference lab has
-no VolumeSnapshotClass annotated with `k10.kasten.io/is-snapshot-class: "true"`
-and Kasten therefore refuses to snapshot a PVC at all. `exportType` was
-`appConfigOnly`, so no volume was provisioned or attached. Everything else in
-"what a passing run proves" held; the volume claim did not get tested. Annotate a
-snapshot class and re-run with a PVC before repeating that claim.
+- **volume restore proven.** A later run restored a namespace holding a 1 GiB
+  PVC. In the target namespace the PVC bound to a fresh PersistentVolume and the
+  pod reached Running, then the namespace was torn down with no `Released` PV
+  left behind
+
+Separately, and going beyond what kdrill itself claims: a 32893 byte file written
+to the volume and never touched by the workload came back with an **identical
+sha256** after snapshot, export to Storj S3 and restore into a new namespace. The
+data survives the round trip. That is not promoted into the scope statement, and
+should not be: one file is not data correctness, and kdrill verifies nothing about
+content.
 
 ---
 
@@ -209,6 +213,7 @@ tested. `[unverified]`
 | Cluster privileges | `cluster-admin`, or enough to create a ClusterRole granting `delete` on namespaces, to apply `deploy/10-rbac.yaml`. |
 | Admission control | `ValidatingAdmissionPolicy`, built in from Kubernetes 1.30, so normally nothing to install. Kyverno is an alternative if you already run it. Required for the guardrail above, not optional in practice. |
 | Container image | `registry.redhat.io/openshift4/ose-cli`. The cluster needs a valid pull secret for `registry.redhat.io`, which OpenShift normally has as part of its global pull secret. |
+| VolumeSnapshotClass | Required if your applications use PersistentVolumeClaims. Some VolumeSnapshotClass must carry the annotation `k10.kasten.io/is-snapshot-class: "true"`, or Kasten refuses to snapshot a PVC at all and the backup fails in the CSI precheck phase. Check with `oc get volumesnapshotclass -o yaml`. Note that annotating one also makes existing policies start snapshotting any PVCs in the namespaces they already back up. |
 | Spare capacity | Enough headroom to provision the restored volumes alongside production. See [docs/sizing.md](docs/sizing.md). |
 | Optional | Prometheus and a Pushgateway, if you want the metrics off-cluster. Without them, metrics are still written to the job log. |
 
@@ -357,10 +362,11 @@ never been tested; those are counted in
 while namespaces have never been tested once, which is why both are alerted on
 separately.
 
-`[unverified]` `curl` availability in `registry.redhat.io/openshift4/ose-cli`,
-which the Pushgateway push depends on. Push failures are logged and non
-blocking, so an absent `curl` degrades to log-only metrics rather than a failed
-run.
+`curl` is present at `/usr/bin/curl` in
+`registry.redhat.io/openshift4/ose-cli`, so the Pushgateway push works.
+`[verified]` by running the image on OpenShift 4.20.30. Push failures are logged
+and non blocking in any case, so a missing `curl` would degrade to log-only
+metrics rather than failing the run.
 
 ## Troubleshooting
 
@@ -435,21 +441,23 @@ rather than a documentation gap:
 
 **Still open**, worth knowing before you interpret a failure:
 
-1. **Volume restore is untested.** See Status above. This is the biggest gap,
-   because it is the part of the scope statement people care about most. It needs
-   a VolumeSnapshotClass annotated with `k10.kasten.io/is-snapshot-class: "true"`,
-   without which Kasten will not snapshot a PVC at all. Note that annotating one
-   also affects existing policies: any policy already backing up a namespace that
-   holds PVCs will start snapshotting them.
-2. **The CronJob image is not portable.** See [Platform](#platform).
-3. **Cross-namespace image pull**, **operator-managed applications**,
-   **StorageClass reclaim policy** and the **Kasten concurrency limiter
-   settings**, all `[unverified]`. See [docs/scope.md](docs/scope.md) and
+1. **The GiB budgets do not work, and you should know why.** `[verified]` on
+   Kasten 9.0.4: `.status.logicalSizeBytes` is populated on local restore points
+   but **absent on exported ones**, which are exactly what kdrill selects. Every
+   selection therefore sizes at 0 GiB and `MAX_RESTORE_GIB` and
+   `MAX_NAMESPACE_GIB` constrain nothing. The script warns when this happens.
+   Treat `MAX_NAMESPACES_PER_RUN` as the only cap that reliably bites. See
    [docs/sizing.md](docs/sizing.md).
-4. **`.status.logicalSizeBytes` can be empty**, in which case every namespace is
-   sized at 0 GiB and the GiB budgets do not constrain anything. It was empty on
-   every restore point on the reference cluster. Check yours before relying on
-   `MAX_RESTORE_GIB`.
+2. **The CronJob image is not portable.** See [Platform](#platform).
+3. **Cross-namespace image pull** and **operator-managed applications**, both
+   `[unverified]`. These are the two most likely causes of a failure that is not
+   the restore's fault. See [docs/scope.md](docs/scope.md).
+4. **StorageClass reclaim policy.** `[unverified]` for `Retain`. On the reference
+   cluster the class was `Delete` and no `Released` PV accumulated across runs.
+   With `Retain`, expect one orphaned PV per volume per cycle. kdrill does not
+   clean these up, deliberately.
+5. **The Kyverno guardrail variant** remains untested, since no Kyverno cluster
+   was available. Prefer the ValidatingAdmissionPolicy, which is verified.
 
 ## Licence
 

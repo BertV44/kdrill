@@ -68,10 +68,20 @@ docs.kasten.io 9.0.3.
 Two consequences of how the size is computed, both worth knowing before you set
 the caps:
 
+- **The GiB budgets are usually inert, and this is the most important sentence
+  on this page.** `[verified]` on Kasten 9.0.4: `.status.logicalSizeBytes` is
+  populated on **local** restore points but **absent on exported ones**, and
+  exported restore points are exactly what kdrill selects. Every selected
+  namespace therefore sizes at 0 GiB, and `MAX_RESTORE_GIB` and
+  `MAX_NAMESPACE_GIB` constrain nothing at all. Measured on the reference
+  cluster: a 1 GiB volume produced a local restore point reporting
+  `logicalSizeBytes: 1073741824` and an exported restore point reporting no size
+  field whatsoever. The script now warns when this happens, rather than letting
+  you believe a budget is protecting you. **Treat `MAX_NAMESPACES_PER_RUN` as
+  the only cap that reliably bites.**
 - The conversion is integer division by 1 GiB, so **any namespace under 1 GiB is
-  counted as 0 GiB**. A pool of many small namespaces consumes namespace slots
-  but effectively no data budget. This is why `MAX_NAMESPACES_PER_RUN` exists as
-  a separate cap and is the one that actually limits such an estate.
+  counted as 0 GiB** even when the field is populated. A pool of many small
+  namespaces consumes namespace slots but effectively no data budget.
 - `logicalSizeBytes` is the logical size, not what crosses the network or lands
   on disk. Do not use these caps to predict storage consumption or transfer
   time. Measure those.
@@ -98,18 +108,37 @@ elapsed time out of the job log, and derive your own GiB per hour.
 
 ## Concurrency
 
-`[unverified]` The Kasten settings that govern how many volume restore
-operations proceed in parallel were **not confirmed** for 9.0.x. See CLAUDE.md
-known unverified item 2.
+`[verified]` on Kasten 9.0.4. The limiters live in the `k10-config` ConfigMap in
+the Kasten namespace, and are also present as environment variables on the
+`executor-svc` deployment. Read yours rather than trusting these numbers:
 
-This matters because `MAX_NAMESPACES_PER_RUN` and the Kasten concurrency limit
-interact: raising the kdrill budget above what Kasten will run in parallel does
-not speed anything up, it just queues subordinate actions inside the same
-`TIMEOUT_SECONDS` window and makes timeouts more likely.
+```bash
+oc -n kasten-io get configmap k10-config -o json   | python3 -c "import json,sys; d=json.load(sys.stdin)['data']; [print(f'{k} = {v}') for k,v in sorted(d.items()) if 'Limiter' in k]"
+```
 
-No tuning guidance is given here until those settings are verified against the
-deployed version. Until then, raise `MAX_NAMESPACES_PER_RUN` one step at a time
-and watch for timeouts rather than reasoning from a documented limit.
+The values observed on the reference cluster, which are the Kasten 9.0.4
+defaults, and the ones that matter for a restore:
+
+| Setting | Default | Meaning for kdrill |
+|---|---:|---|
+| `K10LimiterVolumeRestoresPerCluster` | 10 | Ceiling on parallel volume restores across the whole cluster |
+| `K10LimiterVolumeRestoresPerAction` | 3 | Per subordinate RestoreAction, so per namespace |
+| `K10LimiterWorkloadRestoresPerAction` | 3 | Per namespace |
+| `K10LimiterCsiSnapshotRestoresPerAction` | 3 | Per namespace |
+| `K10LimiterExecutorThreads` | 8 | Total executor concurrency |
+
+What this means in practice. kdrill creates one BatchRestoreAction with one
+subordinate RestoreAction per namespace, so the per-action limits apply per
+namespace and the per-cluster limit is the real ceiling. With the defaults, a
+namespace restores at most 3 volumes in parallel, and the cluster at most 10
+across all namespaces. Setting `MAX_NAMESPACES_PER_RUN` above roughly
+`K10LimiterVolumeRestoresPerCluster / 3` does not make the run finish sooner: the
+extra subordinate actions queue inside the same `TIMEOUT_SECONDS` window, which
+makes a timeout more likely rather than less.
+
+Raise the Kasten limiter before raising the kdrill budget, not after, and only if
+your storage has the headroom. Then raise `MAX_NAMESPACES_PER_RUN` one step at a
+time and watch for timeouts.
 
 ## Storage side effects
 

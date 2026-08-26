@@ -334,7 +334,7 @@ rp_size_gib() {
 # Walk the priority list and admit namespaces until a budget is reached.
 # =====================================================================
 apply_budgets() {
-  local ns rp size total=0
+  local ns rp size total=0 sizeless=0
   log "--- selection ---"
 
   for ns in $(ordered_pool); do
@@ -349,6 +349,7 @@ apply_budgets() {
     fi
 
     size=$(rp_size_gib "$ns" "$rp")
+    [ "$size" -eq 0 ] && sizeless=$(( sizeless + 1 ))
 
     if [ "$size" -gt "$MAX_ONE_GIB" ]; then
       warn "${ns} skipped, ${size} GiB exceeds the per-namespace budget (${MAX_ONE_GIB} GiB), needs a dedicated run"
@@ -367,6 +368,18 @@ apply_budgets() {
   done
 
   log "--- ${#SUBJECT_NS[@]} namespace(s) selected, ${total} GiB total ---"
+
+  # A restore point that reports no size silently disables the GiB budgets,
+  # which is exactly the kind of quiet degradation this tool exists to expose.
+  # [verified] on Kasten 9.0.4: .status.logicalSizeBytes is populated on local
+  # restore points but absent on exported ones, and exported ones are what
+  # kdrill selects. So in practice the GiB budgets are usually inert and
+  # MAX_NAMESPACES_PER_RUN is the cap that actually bites.
+  if [ "$sizeless" -gt 0 ]; then
+    warn "${sizeless} of ${#SUBJECT_NS[@]} selected restore point(s) reported no size."
+    warn "  MAX_RESTORE_GIB and MAX_NAMESPACE_GIB cannot constrain this run."
+    warn "  Limit the workload with MAX_NAMESPACES_PER_RUN instead."
+  fi
 }
 
 # =====================================================================
