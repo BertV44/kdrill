@@ -48,15 +48,19 @@ rules:
     resources: ["networkpolicies"]
     verbs: ["get", "create", "delete"]
 
-  # Read source restore points and their artifacts
+  # Read source restore points. The details subresource is no longer needed:
+  # exported restore points are selected by the k10.kasten.io/exportProfile
+  # label, so the payload is never fetched. Re-add "restorepoints/details" only
+  # if you revert to payload inspection.
   - apiGroups: ["apps.kio.kasten.io"]
-    resources: ["restorepoints", "restorepoints/details"]
+    resources: ["restorepoints"]
     verbs: ["get", "list"]
 
   # Subordinate RestoreActions are created in the target namespaces,
-  # which vary from run to run
+  # which vary from run to run. Only the main resource is read, for
+  # .status.state. The details subresource is not used.
   - apiGroups: ["actions.kio.kasten.io"]
-    resources: ["restoreactions", "restoreactions/details"]
+    resources: ["restoreactions"]
     verbs: ["get", "list", "create", "delete"]
 
   # Failure diagnostics

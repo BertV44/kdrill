@@ -49,12 +49,25 @@ and infer more than is being claimed.
   independently, from whatever restore point was selected for it. Two
   applications that share state are not restored to a consistent point in time
   relative to each other, and nothing checks that they could be.
-- **The ingress path.** OpenShift Routes are excluded from the restore on
+- **The ingress path.** On OpenShift, Routes are excluded from the restore on
   purpose. Restoring a Route with an explicit `spec.host` into a second
   namespace on the same cluster collides with the original and fails with
   `HostAlreadyClaimed`. So the restored application is never reached through the
   router, and the ingress configuration is never exercised. If your recovery
   concern includes DNS and routing, this test does not cover it.
+
+  **On vanilla Kubernetes this exclusion does not apply, and that is a risk, not
+  a feature.** `[unverified]` There are no Routes, so nothing is filtered, and
+  the restore will recreate the application's `Ingress` objects in the target
+  namespace with the same hosts as production. Unlike OpenShift, which refuses
+  the duplicate outright, a typical ingress controller will accept two Ingresses
+  claiming one host and resolve it by its own rules. The failure mode is
+  therefore worse than a failed test: production traffic could be routed to a
+  restored copy. Until this is settled, either run kdrill on OpenShift only, or
+  add `networking.k8s.io/v1 ingresses` to the `excludeResources` filter in
+  `build_bra`, or confirm on your own controller that a duplicate host is inert.
+  This has not been decided in `build_bra` because excluding Ingress is an
+  architecture decision, not a portability detail.
 - **Cluster loss recovery.** kdrill restores onto a working cluster, using a
   working Kasten install, reading a working catalog. It says nothing about
   recovering when the cluster or Kasten itself is gone. That is the separate

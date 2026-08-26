@@ -1,5 +1,12 @@
 # =============================================================================
-# Guardrail for the cluster-wide namespace delete permission.
+# Guardrail for the cluster-wide namespace delete permission, Kyverno variant.
+#
+# PREFER examples/validatingadmissionpolicy-ns-delete-guardrail.yaml UNLESS YOU
+# ALREADY RUN KYVERNO. That variant uses the ValidatingAdmissionPolicy built
+# into Kubernetes 1.30 and later, needs nothing installed, and has been verified
+# end to end on OpenShift 4.20.30 / Kubernetes 1.33.13. This file remains
+# partially unverified, see STATUS below, because no Kyverno cluster was
+# available to test the DELETE path on.
 #
 # WHY THIS EXISTS
 #

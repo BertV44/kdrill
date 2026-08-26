@@ -14,8 +14,13 @@ Reference lab cluster: `oc02.home`.
 
 ## Non-negotiable conventions
 
-- **CLI**: `oc` exclusively. Never `kubectl`, in code, docs, examples or commit
-  messages. This is an OpenShift-first project.
+- **CLI**: OpenShift-first, but no longer OpenShift-only. The script resolves a
+  CLI at runtime into `$CLI` and never hardcodes a binary: `oc` when OpenShift is
+  detected and `oc` is present, `kubectl` otherwise. Both are overridable with
+  `KDRILL_CLI`. In prose and examples, prefer `oc`, because OpenShift remains the
+  primary target and the reference lab; mention `kubectl` where a vanilla
+  Kubernetes reader would otherwise be stuck. Never reintroduce a bare `oc` call
+  in `src/restore-test.sh`. Reversed 2026-08-26, previously `oc` exclusively.
 - **Language**: all repository content in English.
 - **Style**: no em dashes. No emojis in code, manifests or documentation.
 - **Verification discipline**: never state a Veeam product behaviour, field name,
@@ -64,6 +69,17 @@ constraint. If one is challenged, say why and ask before changing it.
    on failure, with a dump of non-Ready pods.
 9. **Namespaces stuck in Terminating are reported, never force deleted.** Stripping
    finalizers can orphan operator-managed resources.
+10. **Platform is detected at runtime, not configured.** `detect_platform` keys off
+   the presence of the `security.openshift.io` API group, which every OpenShift
+   cluster has. Exactly four things vary, each gated on `IS_OPENSHIFT`: the CLI
+   binary, the SCC annotations copied to the target namespace, the DNS namespace
+   the NetworkPolicy allows, and the Route exclusion in the BatchRestoreAction.
+   `KDRILL_PLATFORM` forces the answer when detection is wrong. Adding a fifth
+   divergence is a decision to take deliberately, not to slip in.
+11. **The guardrail of record is a ValidatingAdmissionPolicy**, not Kyverno. It is
+   native from Kubernetes 1.30, needs nothing installed, and behaves identically
+   on both platforms. The Kyverno variant is kept for clusters already running it.
+   `[verified]` end to end on OpenShift 4.20.30 / Kubernetes 1.33.13.
 
 ---
 
@@ -84,9 +100,22 @@ different version.
   `k10.kasten.io/batchRestoreActionName`.
 - `RestorePoint.status` exposes `logicalSizeBytes`, `physicalSizeBytes`,
   `actionTime`, `scheduledTime`.
-- Standard RestorePoint labels are `k10.kasten.io/appName`,
-  `k10.kasten.io/appNamespace`, `k10.kasten.io/appType`. There is no documented
-  label distinguishing local from exported restore points.
+- RestorePoint labels observed on 9.0.4 are `k10.kasten.io/appName`,
+  `k10.kasten.io/appNamespace`, `k10.kasten.io/appType`,
+  `k10.kasten.io/policyName`, `k10.kasten.io/policyNamespace`,
+  `k10.kasten.io/runActionName`, `k10.kasten.io/runActionNamespace`.
+- **Exported restore points carry `k10.kasten.io/exportProfile=<profile name>`
+  and `k10.kasten.io/exportType`.** Local restore points carry neither, even when
+  the policy that produced them names an export profile in its own spec.
+  `[verified]` on Kasten 9.0.4, OpenShift 4.20.30, 2026-08-26. This is the
+  discriminator, and it supersedes the earlier statement that no such label
+  existed. `exportType` was `appConfigOnly` for every exported restore point on
+  the reference cluster, because those namespaces hold no PVCs. The value for a
+  restore point exported with volume data is `[unverified]`.
+- `.status.logicalSizeBytes` **can be absent**. It was empty on every
+  namespace-scoped restore point on the reference cluster, so `rp_size_gib`
+  returns 0 and the GiB budgets do not bite. Do not assume the budgets are
+  protecting you without checking that the field is populated.
 - `RestoreAction.spec.targetNamespace` is documented as being removed; the target
   is `metadata.namespace`.
 - `ValidateAction` validates exported restore points in filesystem mode, with
@@ -103,12 +132,17 @@ different version.
 
 These are the open risks. Do not silently resolve them by guessing.
 
-1. **Exported vs local restore point discrimination.** `[unverified]` No documented
-   label exposes this as of 9.0.4. Current approach greps `EXPORT_MATCH` (the S3
-   location profile name) against the `restorepoints/{name}/details` subresource
-   payload. This must be validated on a live cluster. If the artifacts structure
-   supports a precise jsonpath selector, replace the grep. `hack/discover-export-artifacts.sh`
-   exists to produce the evidence.
+1. **RESOLVED 2026-08-26. Exported vs local restore point discrimination.**
+   Settled on the reference cluster. Exported restore points carry
+   `k10.kasten.io/exportProfile`, so selection is now a server-side label
+   selector, `EXPORT_LABEL=EXPORT_MATCH`. The previous grep over the
+   `restorepoints/{name}/details` payload was **measured to produce false
+   positives**: a local restore point from a backup-only policy matched, because
+   its payload contains
+   `$.status.restorePointDetails.artifacts[0].meta.kanister.meta.profileRef.name`
+   set to the profile name. kdrill would have restored local snapshots while
+   reporting that it had tested the export path. Do not go back to payload
+   matching. `restorepoints/details` was removed from the RBAC as a result.
 2. **Kasten concurrency limiter settings for 9.0.x.** `[unverified]` The Helm keys
    governing parallel volume restore operations were not confirmed. Verify before
    documenting any guidance on raising `MAX_NAMESPACES_PER_RUN`.
@@ -125,16 +159,40 @@ These are the open risks. Do not silently resolve them by guessing.
    not been observed. Validate with a simple stateless app first.
 6. **StorageClass reclaim policy.** With `Retain`, every cycle leaves Released PVs
    behind. Deliberately not automated. Document it, do not silently clean up.
-7. **Coverage ledger key lookup with hyphenated namespace names.** `[unverified]`
-   `ledger_get` reads `-o "jsonpath={.data.$1}"` where `$1` is a namespace name,
-   which normally contains hyphens. If the `oc` jsonpath parser does not resolve a
-   hyphenated key in dotted notation, every lookup returns empty, every namespace
-   looks never tested, and the rotation silently degenerates while
-   `k10_restore_test_untested_namespaces` stays pinned at the pool size. Nothing
-   in the logs looks wrong. The same trap applies to `TIER_LABEL` if it is ever
-   set to a label containing dots or slashes, such as `k10.kasten.io/tier`, which
-   would require bracket notation. Settle it with one `oc patch` and one `oc get`
-   against the ledger ConfigMap on a live cluster.
+7. **RESOLVED 2026-08-26, with a caveat that became a real guard. Ledger key
+   lookup.** Hyphenated keys resolve correctly in dotted jsonpath:
+   `{.data.my-app-namespace}` returns the value, and an absent key returns empty
+   as the never-tested path expects. `ledger_get` is sound and the rotation does
+   not degenerate. The secondary concern is **confirmed real**: a key containing
+   dots or a slash returns empty in dotted notation, verified with
+   `{.metadata.labels.k10.kasten.io/tier}` returning nothing while the bracket
+   form returned the value. Setting `TIER_LABEL` to such a key would silently
+   send every namespace to `DEFAULT_CADENCE_DAYS`. `check_tier_label` now warns
+   at startup. `[verified]` on OpenShift 4.20.30 / Kubernetes 1.33.13.
+8. **The Kyverno guardrail variant.** `[unverified]` Its schema and pattern logic
+   check out against the Kyverno CLI 1.18.1, but no Kyverno cluster was available,
+   so DELETE-time behaviour and subject matching remain unconfirmed for it. The
+   ValidatingAdmissionPolicy variant is verified end to end and is the one to
+   deploy unless Kyverno is already running.
+9. **The container image on vanilla Kubernetes.** `[unverified]`
+   `registry.redhat.io/openshift4/ose-cli` will not pull without a Red Hat pull
+   secret, which a vanilla cluster does not have. A replacement providing bash
+   plus kubectl is needed and none has been tested. This is the main remaining gap
+   in the agnostic claim: the script is portable, the shipped CronJob is not.
+10. **Ingress on vanilla Kubernetes.** `[unverified]` Decision 4 excludes OpenShift
+   Routes because a duplicate `spec.host` fails with `HostAlreadyClaimed`. The
+   vanilla analogue is not handled: nothing filters `networking.k8s.io` Ingress
+   objects, so a restore would recreate them with production hostnames. A typical
+   ingress controller accepts the duplicate rather than refusing it, so the
+   failure mode is production traffic reaching a restored copy, which is worse
+   than a failed test. Needs a decision: exclude Ingress symmetrically with
+   Routes, or document vanilla Kubernetes as OpenShift-only until confirmed.
+   Deliberately not decided unilaterally.
+11. **A real end-to-end restore.** `[unverified]` No restore has been executed.
+   The reference cluster holds restore points only for `openshift-etcd` and
+   `kasten-io`, both excluded as system namespaces, so the eligible pool is empty
+   and no application has been restored yet. Everything up to and including
+   selection is exercised; the BatchRestoreAction path is not.
 
 ---
 

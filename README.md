@@ -8,7 +8,10 @@ reach Ready, records the outcome in a coverage ledger, and tears the namespaces
 down. It answers one question on a schedule: can we actually get this
 application back.
 
-Target: Veeam Kasten 9.0.x on OpenShift 4.x.
+Target: Veeam Kasten 9.0.x on OpenShift 4.x, or on vanilla Kubernetes 1.x.
+OpenShift is the primary target and the reference lab. The platform is detected
+at runtime, so the same script runs on both, and the OpenShift specifics are
+switched off when they do not apply. See [Platform](#platform).
 
 ---
 
@@ -63,17 +66,31 @@ still lets the tool clean up the namespaces it creates. So a CronJob on your
 cluster holds a permission that, on its own, can delete any namespace.
 
 **The mitigation is admission control, and it is not optional.** Deploy
-[examples/kyverno-ns-delete-guardrail.yaml](examples/kyverno-ns-delete-guardrail.yaml),
-or an equivalent `ValidatingAdmissionPolicy`, **before** you deploy the CronJob.
-It denies this ServiceAccount the deletion of any namespace not labelled
-`k10.kasten.io/restore-test=true`.
+[examples/validatingadmissionpolicy-ns-delete-guardrail.yaml](examples/validatingadmissionpolicy-ns-delete-guardrail.yaml)
+**before** you deploy the CronJob. It denies this ServiceAccount the deletion of
+any namespace not labelled `k10.kasten.io/restore-test=true`.
 
-The guardrail's schema and pattern logic are verified against the Kyverno CLI
-1.18.1. Whether Kyverno applies a `validate.pattern` to the existing object on a
-DELETE admission request is **`[unverified]`** and is the load bearing assumption
-of the entire policy. The file contains a two-step test, a negative case and a
-positive case, to settle it on a lab cluster. Run it. A guardrail that silently
-does not match is worse than no guardrail, because it produces false confidence.
+```bash
+oc apply -f examples/validatingadmissionpolicy-ns-delete-guardrail.yaml
+```
+
+That variant uses the `ValidatingAdmissionPolicy` built into Kubernetes 1.30 and
+later, so there is nothing to install, and it behaves the same on OpenShift and
+on vanilla Kubernetes. It is **verified end to end** on OpenShift 4.20.30 /
+Kubernetes 1.33.13:
+
+| Case | Result |
+|---|---|
+| Unlabelled namespace, deleted by the kdrill ServiceAccount | Denied, quoting the policy message |
+| Namespace labelled `k10.kasten.io/restore-test=true`, same ServiceAccount | Deleted, so kdrill can still clean up |
+| Any namespace, deleted by a cluster administrator | Unaffected, the `matchCondition` scopes the policy to that one ServiceAccount |
+
+A [Kyverno variant](examples/kyverno-ns-delete-guardrail.yaml) is provided for
+clusters already running Kyverno. It remains partially `[unverified]`: its schema
+and pattern logic check out against the Kyverno CLI 1.18.1, but its DELETE-time
+behaviour was never confirmed on a cluster. Both files carry the same three-step
+test. Run it after applying, whichever you choose. A guardrail that silently does
+not match is worse than no guardrail, because it produces false confidence.
 
 ### One label key, three meanings. Do not mistype it.
 
@@ -94,18 +111,21 @@ will permit its deletion. The opt-in value is `enabled`, not `true`.
 
 ## Status
 
-The script has been extracted, is `shellcheck` clean, and its manifests are
-structurally validated and cross-checked. **It has not yet completed a run on a
-cluster.** Treat the first deployment as a lab exercise, not a production
-rollout, and work through the open items below.
+Verified on a live cluster, OpenShift 4.20.30 / Kubernetes 1.33.13, Kasten 9.0.4:
 
-Manifests have not been validated with `oc apply --dry-run=server`, which the
-project convention requires, because no cluster was reachable when they were
-written. Do that first:
+- every manifest accepted by `oc apply --dry-run=server`
+- the full selection path exercised end to end with `DRY_RUN=true`, on both the
+  OpenShift and the forced-`kubectl` code paths
+- the ServiceAccount permission matrix checked verb by verb, including negative
+  controls confirming it cannot read secrets, delete pods, write outside its own
+  namespace, or create a BatchRestoreAction outside the Kasten namespace
+- the admission guardrail proven to deny and to allow the right things
 
-```bash
-oc apply --dry-run=server -f deploy/
-```
+**Not yet done: an actual restore.** The reference cluster holds restore points
+only for `openshift-etcd` and `kasten-io`, both excluded as system namespaces, so
+the eligible pool is empty and no application has been restored. Everything up to
+and including selection works; the BatchRestoreAction path is unexercised. Treat
+the first real run as a lab exercise and read the open items below.
 
 ---
 
@@ -135,31 +155,71 @@ oc apply --dry-run=server -f deploy/
    operator-managed resources. On failure, `KEEP_ON_FAILURE=true` retains them
    and dumps the pods that never became Ready.
 
+## Platform
+
+kdrill detects the platform at runtime and adapts. Nothing needs configuring for
+the common cases.
+
+| | OpenShift | Vanilla Kubernetes |
+|---|---|---|
+| CLI | `oc` | `kubectl` |
+| SCC annotations copied to the target namespace | `uid-range`, `supplemental-groups` | none, there is no SCC admission plugin to satisfy |
+| DNS namespace allowed by the NetworkPolicy | `openshift-dns` | `kube-system` |
+| Route exclusion in the BatchRestoreAction | applied | omitted, the API group does not exist |
+| PSA `enforce` label copied | yes | yes, Pod Security Admission is upstream |
+
+Detection keys off the presence of the `security.openshift.io` API group, which
+every OpenShift cluster has. Override any of it when detection is wrong or when
+your cluster is unusual:
+
+| Variable | Values | Default |
+|---|---|---|
+| `KDRILL_PLATFORM` | `auto`, `openshift`, `kubernetes` | `auto` |
+| `KDRILL_CLI` | `oc`, `kubectl` | detected |
+| `DNS_NAMESPACE` | any namespace | per platform, see table above |
+
+`DNS_NAMESPACE` is the one worth checking on a non-default cluster. The
+NetworkPolicy denies all egress except intra-namespace traffic and DNS, so if
+CoreDNS does not live where kdrill expects, pods will not resolve names, will
+never reach Ready, and every namespace will fail for a reason that has nothing
+to do with the restore.
+
+One caveat on portability, stated plainly: the **script** is platform agnostic,
+the **shipped CronJob is not**. Its image is `registry.redhat.io/openshift4/ose-cli`,
+which will not pull on a cluster without a Red Hat pull secret. On vanilla
+Kubernetes, replace the image with one providing bash and kubectl, and set
+`KDRILL_CLI=kubectl`. No specific image is recommended because none has been
+tested. `[unverified]`
+
 ## Requirements
 
 | Requirement | Detail |
 |---|---|
 | Veeam Kasten | 9.0.x, installed and healthy. Earlier and later minors are not verified. |
-| OpenShift | 4.x. kdrill uses SCC annotations and `openshift-dns`, so it is not portable to vanilla Kubernetes as written. |
+| Platform | OpenShift 4.x, or vanilla Kubernetes 1.x. Detected at runtime, see [Platform](#platform). On vanilla Kubernetes the CronJob image must be replaced. |
 | Exported restore points | At least one S3 location profile, and export policies that have actually produced exported restore points. kdrill restores from the export, not from local snapshots. |
 | Cluster privileges | `cluster-admin`, or enough to create a ClusterRole granting `delete` on namespaces, to apply `deploy/10-rbac.yaml`. |
-| Admission controller | Kyverno, or the ability to write a `ValidatingAdmissionPolicy`. Required for the guardrail described above, not optional in practice. |
+| Admission control | `ValidatingAdmissionPolicy`, built in from Kubernetes 1.30, so normally nothing to install. Kyverno is an alternative if you already run it. Required for the guardrail above, not optional in practice. |
 | Container image | `registry.redhat.io/openshift4/ose-cli`. The cluster needs a valid pull secret for `registry.redhat.io`, which OpenShift normally has as part of its global pull secret. |
 | Spare capacity | Enough headroom to provision the restored volumes alongside production. See [docs/sizing.md](docs/sizing.md). |
 | Optional | Prometheus and a Pushgateway, if you want the metrics off-cluster. Without them, metrics are still written to the job log. |
 
 ## Install
 
-Apply in order. Read the RBAC section above first, and deploy the guardrail
-before the CronJob.
+Apply in order. The guardrail comes first, deliberately: it must be in place
+before anything holds the delete permission.
 
 ```bash
+oc apply -f examples/validatingadmissionpolicy-ns-delete-guardrail.yaml
 oc apply -f deploy/00-namespace.yaml
 oc apply -f deploy/10-rbac.yaml
 oc apply -f deploy/20-ledger.yaml
 oc apply -f deploy/30-script-configmap.yaml
 oc apply -f deploy/40-cronjob.yaml
 ```
+
+On vanilla Kubernetes the same order applies, with `kubectl`, and the CronJob
+image must be replaced first. See [Platform](#platform).
 
 `deploy/20-ledger.yaml` is install-time only. Re-applying it over a populated
 ledger has not been verified to preserve existing keys, so do not put it in a
@@ -182,8 +242,24 @@ oc label namespace my-app k10.kasten.io/restore-test=enabled
 oc label namespace my-app backup-tier=1
 ```
 
+Or skip labelling entirely for a first run. `SELECTION_MODE=all` consults no
+label at all and makes every namespace holding a matching exported restore point
+eligible:
+
+```bash
+oc -n k10-restore-test set env cronjob/k10-restore-test SELECTION_MODE=all
+```
+
+The three modes are `opt-in`, which requires `INCLUDE_LABEL` and is the default;
+`opt-out`, eligible unless `EXCLUDE_LABEL` is present; and `all`, no label
+consulted. Use `all` to see what kdrill would pick before committing to a
+labelling scheme, then move to `opt-in` for steady state.
+
 Tier drives the cadence target: 7, 30 and 90 days for tiers 1, 2 and 3, 30 days
-for anything unlabelled. Every knob is an environment variable in
+for anything unlabelled. `TIER_LABEL` must be a flat key: a key containing dots
+or a slash cannot be read by the dotted jsonpath lookup and every namespace would
+silently fall back to the default cadence. The script warns at startup if you set
+one. `[verified]` on OpenShift 4.20. Every knob is an environment variable in
 `deploy/40-cronjob.yaml`, and each one's default is in the script's
 configuration block. The script itself is never edited to change behaviour.
 
@@ -308,7 +384,8 @@ deploy/40-cronjob.yaml                  schedule and all configuration
 hack/build-configmap.sh                 regenerates deploy/30 from src/
 hack/discover-export-artifacts.sh       evidence for open item 1 below
 examples/prometheusrule.yaml
-examples/kyverno-ns-delete-guardrail.yaml
+examples/validatingadmissionpolicy-ns-delete-guardrail.yaml   the guardrail of record
+examples/kyverno-ns-delete-guardrail.yaml                     alternative, if you run Kyverno
 docs/scope.md                           the long form of the scope statement
 docs/sizing.md                          budgets, cadence convergence, storage
 ```
@@ -329,35 +406,37 @@ hack/build-configmap.sh --check
 
 ## Open items
 
-These are tracked in full in CLAUDE.md. The two that block a first production
-deployment:
+These are tracked in full in CLAUDE.md.
 
-1. **Exported vs local restore point discrimination.** `[unverified]` No
-   documented label distinguishes them as of 9.0.4. The script greps
-   `EXPORT_MATCH` against the `restorepoints/{name}/details` payload, which is a
-   substring match over a whole JSON document. If the profile name also appears
-   in a local restore point's payload, kdrill will restore local restore points
-   and silently stop testing the export path, while still reporting passes. Get
-   the evidence:
+**Resolved on 2026-08-26**, recorded here because the first was a correctness bug
+rather than a documentation gap:
 
-   ```bash
-   hack/discover-export-artifacts.sh --list
-   hack/discover-export-artifacts.sh \
-     --local NAMESPACE/RESTOREPOINT --exported NAMESPACE/RESTOREPOINT
-   ```
+- **Exported vs local restore point discrimination.** Exported restore points
+  carry `k10.kasten.io/exportProfile`, so selection is now a server-side label
+  selector. The previous approach grepped the profile name out of the
+  `restorepoints/{name}/details` payload, and that was **measured to produce a
+  false positive** on the reference cluster: a local restore point matched,
+  because its payload carries
+  `$.status.restorePointDetails.artifacts[0].meta.kanister.meta.profileRef.name`
+  set to the profile name. kdrill would have restored local snapshots while
+  reporting that it had tested the export path. Use
+  `hack/discover-export-artifacts.sh` to confirm the same holds on your cluster
+  before trusting the label.
+- **The ledger's jsonpath lookup.** Hyphenated keys resolve correctly. Keys with
+  dots or slashes do not, which is why `TIER_LABEL` is now checked at startup.
 
-   It dumps the artifacts section for both side by side, reports every JSON path
-   where the profile name appears, and states whether the grep discriminates. If
-   it does, replace the grep with a jsonpath selector against the narrowest
-   stable path.
+**Still open**, worth knowing before you interpret a failure:
 
-2. **The admission guardrail's DELETE behaviour.** `[unverified]` See the RBAC
-   section above and the test procedure in the policy file.
-
-Also open, and worth knowing before you interpret a failure: cross-namespace
-image pull, operator-managed applications, StorageClass reclaim policy, and the
-Kasten concurrency limiter settings. See CLAUDE.md and
-[docs/scope.md](docs/scope.md).
+1. **No end-to-end restore has run.** See Status above. This is the biggest gap.
+2. **The CronJob image is not portable.** See [Platform](#platform).
+3. **Cross-namespace image pull**, **operator-managed applications**,
+   **StorageClass reclaim policy** and the **Kasten concurrency limiter
+   settings**, all `[unverified]`. See [docs/scope.md](docs/scope.md) and
+   [docs/sizing.md](docs/sizing.md).
+4. **`.status.logicalSizeBytes` can be empty**, in which case every namespace is
+   sized at 0 GiB and the GiB budgets do not constrain anything. It was empty on
+   every restore point on the reference cluster. Check yours before relying on
+   `MAX_RESTORE_GIB`.
 
 ## Licence
 

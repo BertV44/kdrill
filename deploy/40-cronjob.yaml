@@ -3,11 +3,18 @@
 #
 # Before the first run:
 #   1. Set EXPORT_MATCH to the name of the S3 location profile.
-#   2. Label source namespaces with backup-tier and the opt-in label.
+#   2. Label source namespaces with backup-tier and the opt-in label, or set
+#      SELECTION_MODE=all to run without labelling anything.
 #   3. Run once with DRY_RUN=true and read the selection out of the job log.
 #
 # Every value below is also the script default. The environment block is the
 # supported way to change behaviour; the script itself is not edited.
+#
+# NOT PORTABLE AS SHIPPED: the image below is the OpenShift CLI image from
+# registry.redhat.io. On vanilla Kubernetes it will not pull, because the
+# cluster has no Red Hat pull secret. Replace it with any image that provides
+# bash plus kubectl, and set KDRILL_CLI=kubectl. No specific alternative image
+# is recommended here because none has been tested. [unverified]
 # =============================================================================
 ---
 apiVersion: batch/v1
@@ -52,15 +59,45 @@ spec:
                     fieldRef:
                       fieldPath: metadata.namespace
 
+                # --- platform ---
+                # Both are auto-detected. Uncomment only to override a
+                # misdetection, or to force the vanilla Kubernetes path.
+                # KDRILL_PLATFORM: auto | openshift | kubernetes
+                # KDRILL_CLI     : oc | kubectl
+                # DNS_NAMESPACE  : defaults to openshift-dns on OpenShift and
+                #                  kube-system elsewhere. Set it if your
+                #                  CoreDNS lives somewhere else, otherwise
+                #                  pods will not resolve names and will never
+                #                  reach Ready.
+                # - name: KDRILL_PLATFORM
+                #   value: "auto"
+                # - name: KDRILL_CLI
+                #   value: "oc"
+                # - name: DNS_NAMESPACE
+                #   value: "openshift-dns"
+
                 # --- selection ---
+                # opt-in  : requires INCLUDE_LABEL on the source namespace
+                # opt-out : eligible unless EXCLUDE_LABEL is present
+                # all     : every namespace holding a restore point, no label
+                #           consulted. Use this for a first run on a cluster
+                #           where nothing has been labelled yet.
                 - name: SELECTION_MODE
                   value: "opt-in"
                 - name: INCLUDE_LABEL
                   value: "k10.kasten.io/restore-test=enabled"
+                # TIER_LABEL must be a flat key. A key containing dots or a
+                # slash cannot be read by the dotted jsonpath lookup and every
+                # namespace would silently fall back to DEFAULT_CADENCE_DAYS.
+                # The script warns if you set one. [verified] on OpenShift 4.20.
                 - name: TIER_LABEL
                   value: "backup-tier"
                 - name: RP_SELECTION
                   value: "latest"
+                # Label carrying the export location profile on an exported
+                # restore point. [verified] on Kasten 9.0.4.
+                - name: EXPORT_LABEL
+                  value: "k10.kasten.io/exportProfile"
 
                 # --- cadence targets, days ---
                 - name: TIER1_CADENCE_DAYS

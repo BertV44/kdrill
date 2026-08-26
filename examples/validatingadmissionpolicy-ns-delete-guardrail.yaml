@@ -1,0 +1,113 @@
+# =============================================================================
+# Guardrail for the cluster-wide namespace delete permission, using the
+# ValidatingAdmissionPolicy built into Kubernetes. No third-party admission
+# controller required.
+#
+# Prefer this over the Kyverno variant unless you already run Kyverno:
+#   - it is native, so there is nothing extra to install or keep upgraded
+#   - it works identically on OpenShift and on vanilla Kubernetes
+#   - ValidatingAdmissionPolicy is GA in admissionregistration.k8s.io/v1 from
+#     Kubernetes 1.30. Check availability first:
+#       oc api-resources --api-group=admissionregistration.k8s.io
+#
+# WHY THIS EXISTS
+#
+# deploy/10-rbac.yaml grants the kdrill ServiceAccount "delete" on namespaces
+# cluster-wide, because Kubernetes RBAC authorises verbs on resource types and
+# cannot restrict deletion to names matching a pattern such as *-restored.
+# There is no narrower RBAC grant that still lets the tool clean up after
+# itself. This policy confines that permission to namespaces labelled
+# k10.kasten.io/restore-test=true.
+#
+# Apply this BEFORE deploying the CronJob.
+#
+# STATUS: verified end to end
+#
+# Tested on OpenShift 4.20.30 / Kubernetes 1.33.13:
+#   - an unlabelled namespace is DENIED to the kdrill ServiceAccount
+#   - a namespace labelled k10.kasten.io/restore-test=true is ALLOWED
+#   - cluster administrators are unaffected, the matchCondition scopes the
+#     policy to that one ServiceAccount
+#   - oldObject carries the existing labels on a DELETE request, which is the
+#     load bearing assumption of the whole policy and the point that could not
+#     be confirmed for the Kyverno variant offline
+#
+# Re-run the procedure at the end of this file after any change.
+# =============================================================================
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicy
+metadata:
+  name: kdrill-restrict-ns-deletion
+spec:
+  # Fail closed. If the policy cannot be evaluated, the deletion is refused
+  # rather than quietly allowed.
+  failurePolicy: Fail
+  matchConstraints:
+    resourceRules:
+      - apiGroups: [""]
+        apiVersions: ["v1"]
+        operations: ["DELETE"]
+        resources: ["namespaces"]
+  matchConditions:
+    # Scope the policy to the kdrill ServiceAccount alone. Without this, the
+    # policy would also block administrators from deleting ordinary
+    # namespaces. Change the namespace here if you install kdrill elsewhere.
+    - name: only-kdrill-serviceaccount
+      expression: >-
+        request.userInfo.username ==
+        'system:serviceaccount:k10-restore-test:k10-restore-test'
+  validations:
+    # On a DELETE the incoming object is null and the existing object is in
+    # oldObject, so the label is read from there. The membership test comes
+    # first because a namespace may carry no labels map at all.
+    - expression: >-
+        has(oldObject.metadata.labels) &&
+        'k10.kasten.io/restore-test' in oldObject.metadata.labels &&
+        oldObject.metadata.labels['k10.kasten.io/restore-test'] == 'true'
+      message: >-
+        The kdrill ServiceAccount may only delete namespaces labelled
+        k10.kasten.io/restore-test=true. This namespace is not one of kdrill's
+        disposable restore targets, so the deletion was denied.
+      reason: Forbidden
+
+---
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingAdmissionPolicyBinding
+metadata:
+  name: kdrill-restrict-ns-deletion
+spec:
+  policyName: kdrill-restrict-ns-deletion
+  validationActions: ["Deny"]
+
+# =============================================================================
+# HOW TO VERIFY IT
+#
+# Run this after applying, and after any edit. The negative case is the one
+# that matters: a guardrail that silently does not match produces false
+# confidence, which is worse than no guardrail.
+#
+#   # 1. NEGATIVE CASE: an unlabelled namespace must NOT be deletable.
+#   oc create namespace kdrill-guardrail-probe
+#   oc --as=system:serviceaccount:k10-restore-test:k10-restore-test \
+#      delete namespace kdrill-guardrail-probe
+#   # Expected: denied, quoting the message above.
+#   # If it succeeds, stop. The ServiceAccount can delete any namespace.
+#
+#   # 2. POSITIVE CASE: a labelled namespace must remain deletable, otherwise
+#   #    kdrill can never clean up and every run leaks namespaces.
+#   oc label namespace kdrill-guardrail-probe k10.kasten.io/restore-test=true
+#   oc --as=system:serviceaccount:k10-restore-test:k10-restore-test \
+#      delete namespace kdrill-guardrail-probe
+#   # Expected: deleted.
+#
+#   # 3. Confirm administrators are unaffected.
+#   oc create namespace kdrill-admin-probe
+#   oc delete namespace kdrill-admin-probe
+#   # Expected: deleted, because the matchCondition scopes the policy to the
+#   # kdrill ServiceAccount only.
+#
+# On OpenShift, note that a project created through the project API may carry
+# extra labels. That is irrelevant here: the policy tests one specific key and
+# ignores everything else.
+# =============================================================================
