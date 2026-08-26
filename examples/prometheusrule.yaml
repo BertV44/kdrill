@@ -65,6 +65,15 @@ spec:
         - alert: KdrillRunStale
           # The CronJob schedule is daily. 36h tolerates one missed run plus
           # the activeDeadlineSeconds window, and fires on the second miss.
+          #
+          # IF YOU RUN ON DEMAND RATHER THAN ON A SCHEDULE, RETUNE OR REMOVE
+          # THIS RULE. It measures invocation, not coverage, so with a weekly
+          # or ad-hoc trigger it fires permanently and teaches the on-call to
+          # ignore kdrill alerts. Either raise the threshold to your real
+          # cadence, or delete this rule and rely on KdrillCoverageStale and
+          # KdrillNamespacesNeverTested, which measure coverage directly and
+          # are correct regardless of what triggers the run. See the README
+          # section "Running without a CronJob".
           expr: time() - k10_restore_test_last_run_timestamp{job="k10_restore_test"} > 36 * 3600
           for: 30m
           labels:

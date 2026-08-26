@@ -306,6 +306,89 @@ well, and leaves the intent in git rather than only in the live object.
 Read the `--- selection ---` block in the log. If it selected nothing, the
 reason is printed per namespace.
 
+## Running without a CronJob
+
+Some clusters will not run the CronJob, and that is a supported path rather than
+a workaround. Reasons that come up in practice:
+
+- the schedule lives in an external orchestrator, Tekton, Argo Workflows,
+  Ansible, or an existing enterprise scheduler
+- change control requires a human to authorise each restore test
+- a one-off check before or after a cluster upgrade
+- cluster policy forbids CronJob
+
+Apply `deploy/00` through `deploy/30` as normal, then use
+[examples/job-on-demand.yaml](examples/job-on-demand.yaml) **instead of**
+`deploy/40-cronjob.yaml`, not in addition to it.
+
+```bash
+oc create -f examples/job-on-demand.yaml
+```
+
+It carries `generateName`, so **`oc create`, never `oc apply`**. Apply refuses a
+generated name, and a completed Job cannot be re-applied anyway because its spec
+is immutable. Creating is what makes the run repeatable: each invocation produces
+a fresh `k10-restore-test-<suffix>`.
+
+Override anything for a single run without editing the file:
+
+```bash
+oc create -f examples/job-on-demand.yaml --dry-run=client -o yaml | oc set env --local -f - -o yaml SELECTION_MODE=all DRY_RUN=true | oc create -f -
+```
+
+`oc set env --local` preserves `generateName` and every other variable. Verified
+on `oc` 4.21.
+
+That file is generated from the CronJob, so the two paths cannot drift:
+
+```bash
+hack/build-job.sh
+```
+
+### Four consequences of dropping the CronJob
+
+These are the things that actually bite, so they are listed rather than implied.
+
+**1. Alerting breaks unless you retune it.** This is the important one.
+`KdrillRunStale` in [examples/prometheusrule.yaml](examples/prometheusrule.yaml)
+fires when `k10_restore_test_last_run_timestamp` is more than 36 hours old,
+because the shipped CronJob is daily. If you run weekly on demand, that alert is
+permanently firing and you will learn to ignore it, which defeats the purpose.
+Raise the threshold to match your real cadence, or drop that one rule and rely on
+`KdrillCoverageStale` and `KdrillNamespacesNeverTested` instead, which measure
+coverage rather than invocation.
+
+**2. No `concurrencyPolicy: Forbid`.** The CronJob prevents overlapping runs; a
+Job created twice does not. Two concurrent runs that select the same namespace
+race on the target namespace, and the loser logs
+`ERROR: <ns>-restored already exists, leftover from a previous run, skipped`,
+drops that namespace and exits 1.
+
+Nothing is corrupted, but be precise about how that surfaces, because it is
+easy to miss. The collided namespace is **not** counted in
+`k10_restore_test_failed_namespaces`, which only reflects subordinate
+RestoreAction states, and it is not counted in
+`k10_restore_test_selected_namespaces` either, since it never got staged. So the
+only evidence is the non-zero exit code, visible as a failed Job in
+kube-state-metrics, plus the log line. Serialise in whatever triggers the Job
+rather than relying on kdrill's own metrics to tell you.
+
+**3. No history limits.** The CronJob keeps the last 7 successes and 7 failures.
+Completed Jobs created by hand accumulate until removed. The logs are the primary
+output of kdrill, so do not add a TTL blindly; prune deliberately:
+
+```bash
+oc -n k10-restore-test delete job -l kdrill.io/trigger=on-demand --field-selector=status.successful=1
+```
+
+**4. The coverage ledger still works, and still matters.** Rotation is driven by
+the ledger and the per-tier cadences, not by the schedule, so priority ordering
+behaves identically. But a cadence target is a promise about elapsed time: if
+nothing triggers the Job, `k10_restore_test_max_staleness_days` climbs and no
+cadence is met. On-demand means you own the cadence. See
+[docs/sizing.md](docs/sizing.md) for the convergence arithmetic, which applies
+unchanged with "per run" substituted for "per day".
+
 ## Teardown
 
 Remove in reverse order. The CronJob first, so that no run can start midway
@@ -396,7 +479,9 @@ deploy/20-ledger.yaml                   coverage ledger ConfigMap
 deploy/30-script-configmap.yaml         GENERATED, never hand-edited
 deploy/40-cronjob.yaml                  schedule and all configuration
 hack/build-configmap.sh                 regenerates deploy/30 from src/
+hack/build-job.sh                       regenerates the on-demand Job from deploy/40
 hack/discover-export-artifacts.sh       evidence for open item 1 below
+examples/job-on-demand.yaml             GENERATED, the no-CronJob path
 examples/prometheusrule.yaml
 examples/validatingadmissionpolicy-ns-delete-guardrail.yaml   the guardrail of record
 examples/kyverno-ns-delete-guardrail.yaml                     alternative, if you run Kyverno
@@ -404,18 +489,21 @@ docs/scope.md                           the long form of the scope statement
 docs/sizing.md                          budgets, cadence convergence, storage
 ```
 
-`deploy/30-script-configmap.yaml` is generated from `src/restore-test.sh`. Edit
-the script, then:
+Two files are generated and must never be hand-edited.
+`deploy/30-script-configmap.yaml` comes from `src/restore-test.sh`, and
+`examples/job-on-demand.yaml` comes from `deploy/40-cronjob.yaml`, which is what
+keeps the scheduled and on-demand paths identical. Edit the source, then:
 
 ```bash
 hack/build-configmap.sh
+hack/build-job.sh
 ```
 
-The generation is deterministic, so a rebuild with no source change produces no
-git diff. To assert that in CI or a pre-commit hook:
+Both are deterministic, so a rebuild with no source change produces no git diff.
+To assert that in CI or a pre-commit hook:
 
 ```bash
-hack/build-configmap.sh --check
+hack/build-configmap.sh --check && hack/build-job.sh --check
 ```
 
 ## Open items

@@ -1,0 +1,173 @@
+# =============================================================================
+# GENERATED FILE. DO NOT EDIT.
+#
+# Produced by hack/build-job.sh from deploy/40-cronjob.yaml.
+# Edit the CronJob, then run: hack/build-job.sh
+#
+# deploy/40-cronjob.yaml sha256: ccb12b2cef2bdb3472551642004c416567dba7ccb4ea7d896d90d5c47de83110
+# =============================================================================
+#
+# On-demand kdrill run, for clusters that do not use the CronJob.
+#
+# Use this when the schedule lives somewhere else: an external orchestrator
+# such as Tekton, Argo Workflows or Ansible, a change-control process where a
+# restore test only runs once a human has authorised it, a one-off check
+# before or after a cluster upgrade, or a policy that forbids CronJob.
+#
+# This is an alternative to deploy/40-cronjob.yaml, not an addition. Apply
+# deploy/00 through deploy/30, then use this instead of deploy/40.
+#
+# It carries generateName, not name, so create it and let the API server
+# name each run:
+#
+#   oc create -f examples/job-on-demand.yaml
+#
+# `oc apply` will NOT work on this file, by design: apply needs a fixed name,
+# and a completed Job cannot be re-applied because its spec is immutable.
+# Creating is what makes the run repeatable.
+#
+# Override any environment variable for a single run, without editing this
+# file, by piping through `oc set env --local`:
+#
+#   oc create -f examples/job-on-demand.yaml --dry-run=client -o yaml \
+#     | oc set env --local -f - -o yaml SELECTION_MODE=all DRY_RUN=true \
+#     | oc create -f -
+#
+# That preserves generateName and every other variable. Verified on oc 4.21.
+# =============================================================================
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  generateName: k10-restore-test-
+  namespace: k10-restore-test
+  labels:
+    app.kubernetes.io/name: k10-restore-test
+    kdrill.io/trigger: on-demand
+  annotations:
+    kdrill.io/generated-by: hack/build-job.sh
+    kdrill.io/source-sha256: "ccb12b2cef2bdb3472551642004c416567dba7ccb4ea7d896d90d5c47de83110"
+spec:
+  # No automatic retry. A failed restore test is a signal to investigate,
+  # not something to paper over with a rerun.
+  backoffLimit: 0
+  # Must exceed TIMEOUT_SECONDS plus cleanup time.
+  activeDeadlineSeconds: 4200
+  template:
+    spec:
+      serviceAccountName: k10-restore-test
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore-test
+          image: registry.redhat.io/openshift4/ose-cli:latest
+          command: ["/bin/bash", "/scripts/restore-test.sh"]
+          env:
+            # --- required ---
+            - name: EXPORT_MATCH
+              value: "CHANGEME-s3-location-profile-name"
+            - name: SELF_NS
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+
+            # --- platform ---
+            # Both are auto-detected. Uncomment only to override a
+            # misdetection, or to force the vanilla Kubernetes path.
+            # KDRILL_PLATFORM: auto | openshift | kubernetes
+            # KDRILL_CLI     : oc | kubectl
+            # DNS_NAMESPACE  : defaults to openshift-dns on OpenShift and
+            #                  kube-system elsewhere. Set it if your
+            #                  CoreDNS lives somewhere else, otherwise
+            #                  pods will not resolve names and will never
+            #                  reach Ready.
+            # - name: KDRILL_PLATFORM
+            #   value: "auto"
+            # - name: KDRILL_CLI
+            #   value: "oc"
+            # - name: DNS_NAMESPACE
+            #   value: "openshift-dns"
+
+            # --- selection ---
+            # opt-in  : requires INCLUDE_LABEL on the source namespace
+            # opt-out : eligible unless EXCLUDE_LABEL is present
+            # all     : every namespace holding a restore point, no label
+            #           consulted. Use this for a first run on a cluster
+            #           where nothing has been labelled yet.
+            - name: SELECTION_MODE
+              value: "opt-in"
+            - name: INCLUDE_LABEL
+              value: "k10.kasten.io/restore-test=enabled"
+            # TIER_LABEL must be a flat key. A key containing dots or a
+            # slash cannot be read by the dotted jsonpath lookup and every
+            # namespace would silently fall back to DEFAULT_CADENCE_DAYS.
+            # The script warns if you set one. [verified] on OpenShift 4.20.
+            - name: TIER_LABEL
+              value: "backup-tier"
+            - name: RP_SELECTION
+              value: "latest"
+            # Label carrying the export location profile on an exported
+            # restore point. [verified] on Kasten 9.0.4.
+            - name: EXPORT_LABEL
+              value: "k10.kasten.io/exportProfile"
+
+            # --- cadence targets, days ---
+            - name: TIER1_CADENCE_DAYS
+              value: "7"
+            - name: TIER2_CADENCE_DAYS
+              value: "30"
+            - name: TIER3_CADENCE_DAYS
+              value: "90"
+            - name: DEFAULT_CADENCE_DAYS
+              value: "30"
+
+            # --- budgets ---
+            - name: MAX_NAMESPACES_PER_RUN
+              value: "2"
+            - name: MAX_RESTORE_GIB
+              value: "200"
+            - name: MAX_NAMESPACE_GIB
+              value: "100"
+
+            # --- execution ---
+            - name: K10_NS
+              value: "kasten-io"
+            - name: TARGET_SUFFIX
+              value: "-restored"
+            - name: TIMEOUT_SECONDS
+              value: "3600"
+            - name: POLL_INTERVAL
+              value: "20"
+            - name: KEEP_ON_FAILURE
+              value: "true"
+            - name: DRY_RUN
+              value: "false"
+            # Requires curl in the image. [unverified] for
+            # registry.redhat.io/openshift4/ose-cli. Metric push failures
+            # are logged and non blocking.
+            # - name: PUSHGATEWAY_URL
+            #   value: "http://pushgateway.monitoring.svc:9091"
+          volumeMounts:
+            - name: script
+              mountPath: /scripts
+              readOnly: true
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+      volumes:
+        - name: script
+          configMap:
+            name: k10-restore-test-script
+            defaultMode: 0555
