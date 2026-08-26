@@ -92,8 +92,10 @@ failure before believing it.
   internal registry with a `<source-ns>/<image>` reference is expected to hit
   `ImagePullBackOff` in the restored namespace, because the restored
   ServiceAccounts have no `system:image-puller` on the source namespace. This
-  fails the readiness criterion for a reason unrelated to the restore. Needs a
-  lab reproduction, see CLAUDE.md unverified item 4.
+  fails the readiness criterion for a reason unrelated to the restore. Not yet
+  reproduced: the reference cluster has its internal registry removed, so it
+  cannot exhibit the problem. If your cluster runs the registry, expect this and
+  read the failure before blaming the backup.
 - **Operator-managed applications.** `[unverified]` Operators such as
   CloudNativePG reconcile restored CRs in the new namespace with behaviour that
   has not been observed. Validate with a simple stateless application first.

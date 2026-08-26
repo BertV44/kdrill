@@ -450,13 +450,12 @@ rather than a documentation gap:
    [docs/sizing.md](docs/sizing.md).
 2. **The CronJob image is not portable.** See [Platform](#platform).
 3. **Cross-namespace image pull** and **operator-managed applications**, both
-   `[unverified]`. These are the two most likely causes of a failure that is not
+   `[unverified]`, and both blocked on the environment rather than on effort. The
+   reference cluster has its internal image registry removed, so it cannot
+   exhibit the image-pull problem at all, and it has no application operator
+   installed. These remain the two most likely causes of a failure that is not
    the restore's fault. See [docs/scope.md](docs/scope.md).
-4. **StorageClass reclaim policy.** `[unverified]` for `Retain`. On the reference
-   cluster the class was `Delete` and no `Released` PV accumulated across runs.
-   With `Retain`, expect one orphaned PV per volume per cycle. kdrill does not
-   clean these up, deliberately.
-5. **The Kyverno guardrail variant** remains untested, since no Kyverno cluster
+4. **The Kyverno guardrail variant** remains untested, since no Kyverno cluster
    was available. Prefer the ValidatingAdmissionPolicy, which is verified.
 
 ## Licence

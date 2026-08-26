@@ -147,12 +147,20 @@ namespace. During a run, the cluster carries the selected namespaces' volumes in
 addition to production. Peak additional provisioned capacity is bounded by
 `MAX_RESTORE_GIB`, subject to the integer-division caveat above.
 
-`[unverified]` If the StorageClass reclaim policy is `Retain`, deleting the test
-namespace leaves the PersistentVolume behind in `Released`. Every cycle then
-accumulates orphaned PVs until someone reclaims them. kdrill does not clean these
-up, deliberately: automatically deleting PVs from a tool that already holds
-cluster-wide namespace delete is not a trade worth making. See CLAUDE.md
-unverified item 6.
+`[verified]` on OpenShift 4.20.30. If the StorageClass reclaim policy is
+`Retain`, deleting the test namespace leaves the PersistentVolume behind in
+`Released`, and it persists after the namespace is gone. Measured directly: a PVC
+bound on a `Retain` class, namespace deleted, PV observed moving `Bound` to
+`Released` and staying. Every cycle therefore accumulates one orphaned PV per
+volume until someone reclaims them, and on a local provisioner such as topolvm
+those hold real disk on the node.
+
+With `Delete`, which was the reference cluster's default, repeated kdrill runs
+left zero `Released` PVs.
+
+kdrill does not clean these up, deliberately: automatically deleting PVs from a
+tool that already holds cluster-wide namespace delete is not a trade worth
+making.
 
 Check for the accumulation, on a schedule:
 

@@ -168,17 +168,34 @@ These are the open risks. Do not silently resolve them by guessing.
    Present at `/usr/bin/curl`. `wget`, `python3` and `bash` are there too.
    Verified by running the image on the reference cluster. The Pushgateway push
    works.
-4. **Cross-namespace image pull.** `[unverified]` Applications pulling from the
-   internal OpenShift registry with a `<source-ns>/<image>` reference will hit
-   ImagePullBackOff in the restored namespace, because its ServiceAccounts lack
-   `system:image-puller` on the source namespace. This would fail the readiness
-   criterion for reasons unrelated to the restore itself. Needs a lab reproduction
-   and a documented decision on whether to automate the role binding.
-5. **Operator-managed applications.** `[unverified]` CloudNativePG and similar
-   operators reconcile restored CRs in the new namespace with behaviour that has
-   not been observed. Validate with a simple stateless app first.
-6. **StorageClass reclaim policy.** With `Retain`, every cycle leaves Released PVs
-   behind. Deliberately not automated. Document it, do not silently clean up.
+4. **Cross-namespace image pull.** `[unverified]`, and **not testable on the
+   reference cluster**: its internal image registry is removed
+   (`configs.imageregistry.operator.openshift.io/cluster` has
+   `managementState: Removed` and there is no `image-registry` service), so no
+   application there can reference `<source-ns>/<image>`. The concern stands on
+   clusters that do run the registry: the restored namespace's ServiceAccounts
+   lack `system:image-puller` on the source namespace, which would fail readiness
+   for a reason unrelated to the restore. Note that Kasten has an
+   `K10LimiterImageCopiesPerCluster` limiter, so it may copy images rather than
+   reference them; that was not exercised either. Needs a cluster with the
+   registry enabled, then a documented decision on whether to automate the role
+   binding.
+5. **Operator-managed applications.** `[unverified]`. The prerequisite is now
+   met: a simple application with a volume has been validated end to end, so this
+   is the next step rather than a premature one. Still untested because the
+   reference cluster has no application operator installed, only
+   `k10-kasten-operator-rhmp`, `local-storage-operator`, `lvms-operator` and
+   `packageserver`. Testing it means installing something like CloudNativePG,
+   which is a deliberate cluster change, not a side effect of a test run.
+6. **RESOLVED 2026-08-26. StorageClass reclaim policy.** Verified directly. A PVC
+   bound on a `Retain` StorageClass, then removed the way kdrill removes it, by
+   deleting the namespace: the PersistentVolume moved to `Released` and persisted
+   after the namespace was gone. So with `Retain` each cycle does leave one
+   orphaned PV per volume, and on a local provisioner such as topolvm that holds
+   real disk. The reference cluster's default class is `Delete`, where repeated
+   kdrill runs left zero `Released` PVs. Still deliberately not automated:
+   deleting PVs from a tool that already holds cluster-wide namespace delete is
+   not a trade worth making.
 7. **RESOLVED 2026-08-26, with a caveat that became a real guard. Ledger key
    lookup.** Hyphenated keys resolve correctly in dotted jsonpath:
    `{.data.my-app-namespace}` returns the value, and an absent key returns empty
