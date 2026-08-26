@@ -76,6 +76,23 @@ constraint. If one is challenged, say why and ask before changing it.
    the NetworkPolicy allows, and the Route exclusion in the BatchRestoreAction.
    `KDRILL_PLATFORM` forces the answer when detection is wrong. Adding a fifth
    divergence is a decision to take deliberately, not to slip in.
+15. **Reporting is a separate, self-contained script.** `src/kdrill-report.sh`
+   reads the ledger and reports; it never restores and never writes. It is the
+   deliverable behind decision 5: deterministic rotation exists so that this
+   report can state a coverage guarantee over a known pool rather than a
+   confidence interval. It repeats a little eligibility logic from
+   `restore-test.sh` **on purpose**, because being a single copyable file matters
+   more here than avoiding duplication. When eligibility rules change, change
+   both. It exits 1 when anything is overdue or never tested, so it gates a
+   pipeline. Added 2026-08-26.
+14. **The ledger has two backends, and the file one is not a second-class
+   citizen.** `LEDGER_BACKEND=configmap` is the in-cluster default;
+   `LEDGER_BACKEND=file` writes a TAB separated, sorted, atomically replaced file
+   so kdrill can run from a workstation, a CI runner or any external scheduler
+   with no Kubernetes object of its own. Clients asking for freedom from
+   Kubernetes adherence get a bash script, a kubeconfig and a file. The file IS
+   the coverage record in that mode, which the docs say plainly. Added
+   2026-08-26.
 13. **Running without a CronJob is supported.** Some clusters schedule from
    outside, or gate restore tests behind change control, or forbid CronJob by
    policy. `examples/job-on-demand.yaml` carries `generateName`, so it is created
@@ -145,6 +162,14 @@ different version.
   Deleting.
 - API groups: `actions.kio.kasten.io/v1alpha1` for actions,
   `apps.kio.kasten.io/v1alpha1` for restore points.
+
+Not a Kasten fact, but load bearing and verified the hard way: GNU `date` and BSD
+`date` parse an RFC3339 string with different flags, `-d` against `-j -f`. The
+old code used the GNU form with a `|| echo 0` fallback, so on macOS or any BSD it
+returned 0, `days_since` returned 99999, and **every namespace looked never
+tested** while nothing in the log looked wrong. Both flavours are now detected and
+a missing one is fatal rather than silent. `[verified]` on macOS 15 BSD date and
+on the RHEL-based container image.
 
 ---
 

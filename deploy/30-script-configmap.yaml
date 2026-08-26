@@ -4,7 +4,7 @@
 # Produced by hack/build-configmap.sh from src/restore-test.sh.
 # Edit the script, then run: hack/build-configmap.sh
 #
-# src/restore-test.sh sha256: a760529e2ea47725a06c20ef52a26c4fd567463eb975e168f426d59e201a6664
+# src/restore-test.sh sha256: 7485208f25390cd0a4d6c64c4d9a05a4fd057bbae56079b4c307611f920c5f02
 # =============================================================================
 ---
 apiVersion: v1
@@ -14,7 +14,7 @@ metadata:
   namespace: k10-restore-test
   annotations:
     kdrill.io/generated-by: hack/build-configmap.sh
-    kdrill.io/source-sha256: "a760529e2ea47725a06c20ef52a26c4fd567463eb975e168f426d59e201a6664"
+    kdrill.io/source-sha256: "7485208f25390cd0a4d6c64c4d9a05a4fd057bbae56079b4c307611f920c5f02"
 data:
   restore-test.sh: |
     #!/usr/bin/env bash
@@ -85,6 +85,15 @@ data:
     KEEP_ON_FAILURE="${KEEP_ON_FAILURE:-true}"
     DRY_RUN="${DRY_RUN:-false}"
     LEDGER="${LEDGER_CONFIGMAP:-k10-restore-test-ledger}"
+
+    # Where coverage history lives.
+    #   configmap : a ConfigMap in SELF_NS, the in-cluster default
+    #   file      : a plain TAB separated file, for running kdrill from a
+    #               workstation, a CI runner or any external scheduler with no
+    #               Kubernetes object of its own. Back this file up: it IS the
+    #               coverage record.
+    LEDGER_BACKEND="${LEDGER_BACKEND:-configmap}"
+    LEDGER_FILE="${LEDGER_FILE:-${HOME:-/tmp}/.kdrill/ledger}"
 
     # Namespaces never eligible, extended regex
     SYSTEM_NS_RE="${SYSTEM_NS_REGEX:-^(openshift|kube|default$|kasten-io$|k10-restore-test$)}"
@@ -186,6 +195,34 @@ data:
       fi
     }
 
+    # GNU date and BSD date parse an RFC3339 string with different flags. Getting
+    # this wrong is not loud: date fails, days_since falls back to 99999, every
+    # namespace looks never tested, the rotation degenerates and nothing in the log
+    # looks wrong. So the flavour is detected once and a missing one is fatal.
+    DATE_FLAVOUR=""
+
+    detect_date_flavour() {
+      if date -u -d "2000-01-01T00:00:00Z" +%s >/dev/null 2>&1; then
+        DATE_FLAVOUR="gnu"
+      elif date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "2000-01-01T00:00:00Z" +%s >/dev/null 2>&1; then
+        DATE_FLAVOUR="bsd"
+      else
+        fail "no usable date implementation: neither GNU 'date -d' nor BSD 'date -j -f' works."
+        fail "  Coverage ages cannot be computed, so the rotation would treat every"
+        fail "  namespace as never tested. Install GNU coreutils or run in a container."
+        exit 1
+      fi
+    }
+
+    # Converts an RFC3339 timestamp to epoch seconds, 0 if unparseable.
+    epoch_of() {
+      case "$DATE_FLAVOUR" in
+        gnu) date -u -d "$1" +%s 2>/dev/null || echo 0 ;;
+        bsd) date -u -j -f "%Y-%m-%dT%H:%M:%SZ" "$1" +%s 2>/dev/null || echo 0 ;;
+        *)   echo 0 ;;
+      esac
+    }
+
     # Warns about a label key that the dotted jsonpath form cannot read.
     # [verified] on OpenShift 4.20 / Kubernetes 1.33: a key containing hyphens
     # resolves correctly in dotted notation, but a key containing dots or a slash
@@ -205,22 +242,62 @@ data:
     # =====================================================================
     # Coverage ledger
     # =====================================================================
+    # The ledger is the coverage record. Two backends, same contract: get returns a
+    # timestamp or nothing, set records one and never aborts the run on failure.
+    #
+    # [verified] on OpenShift 4.20 / Kubernetes 1.33: a hyphenated key resolves in
+    # dotted jsonpath, so a namespace name works directly as a ConfigMap key.
     ledger_get() {
-      "$CLI" -n "$SELF_NS" get configmap "$LEDGER" \
-        -o "jsonpath={.data.$1}" 2>/dev/null || true
+      case "$LEDGER_BACKEND" in
+        file)
+          if [ -f "$LEDGER_FILE" ]; then
+            awk -F'\t' -v k="$1" '$1 == k { print $2; exit }' "$LEDGER_FILE"
+          fi
+          ;;
+        *)
+          "$CLI" -n "$SELF_NS" get configmap "$LEDGER" \
+            -o "jsonpath={.data.$1}" 2>/dev/null || true
+          ;;
+      esac
     }
 
     ledger_set() {
-      "$CLI" -n "$SELF_NS" patch configmap "$LEDGER" --type merge \
-        -p "{\"data\":{\"$1\":\"$2\"}}" >/dev/null 2>&1 \
-        || warn "could not update ledger entry for $1"
+      local dir tmp
+      case "$LEDGER_BACKEND" in
+        file)
+          dir=$(dirname "$LEDGER_FILE")
+          if ! mkdir -p "$dir" 2>/dev/null; then
+            warn "cannot create ledger directory ${dir}, coverage not recorded"
+            return 0
+          fi
+          tmp="${LEDGER_FILE}.tmp.$$"
+          # Rewrite whole file: drop any existing row for this key, append the new
+          # one, sort for a stable diff. The group ends on printf so it always
+          # exits 0, which matters under pipefail.
+          {
+            if [ -f "$LEDGER_FILE" ]; then
+              awk -F'\t' -v k="$1" '$1 != k' "$LEDGER_FILE"
+            fi
+            printf '%s\t%s\n' "$1" "$2"
+          } | LC_ALL=C sort > "$tmp"
+          if ! mv "$tmp" "$LEDGER_FILE" 2>/dev/null; then
+            rm -f "$tmp" 2>/dev/null || true
+            warn "could not update ledger file for $1"
+          fi
+          ;;
+        *)
+          "$CLI" -n "$SELF_NS" patch configmap "$LEDGER" --type merge \
+            -p "{\"data\":{\"$1\":\"$2\"}}" >/dev/null 2>&1 \
+            || warn "could not update ledger entry for $1"
+          ;;
+      esac
     }
 
     days_since() {
       # $1 = RFC3339 timestamp, empty means never tested
       local ref
       if [ -z "$1" ]; then echo 99999; return; fi
-      ref=$(date -u -d "$1" +%s 2>/dev/null || echo 0)
+      ref=$(epoch_of "$1")
       [ "$ref" -eq 0 ] && { echo 99999; return; }
       echo $(( (NOW - ref) / 86400 ))
     }
@@ -617,7 +694,13 @@ data:
 
     detect_cli
     detect_platform
+    detect_date_flavour
     check_tier_label
+
+    case "$LEDGER_BACKEND" in
+      configmap|file) : ;;
+      *) fail "LEDGER_BACKEND must be configmap or file, got '${LEDGER_BACKEND}'"; exit 1 ;;
+    esac
 
     if [ "$IS_OPENSHIFT" = "true" ]; then
       log "platform: OpenShift, cli: ${CLI}, dns namespace: ${DNS_NAMESPACE}"
@@ -627,6 +710,12 @@ data:
     fi
     log "selection mode: ${SELECTION_MODE}, restore point selection: ${RP_SELECTION}"
     log "export label: ${EXPORT_LABEL}=${EXPORT_MATCH}"
+    if [ "$LEDGER_BACKEND" = "file" ]; then
+      log "ledger: file ${LEDGER_FILE} (no Kubernetes object holds coverage state)"
+    else
+      log "ledger: configmap ${SELF_NS}/${LEDGER}"
+    fi
+    log "date: ${DATE_FLAVOUR}"
     log "budgets: ${MAX_NS} namespaces, ${MAX_TOTAL_GIB} GiB total, ${MAX_ONE_GIB} GiB per namespace"
 
     build_pool

@@ -51,7 +51,8 @@ Read this before repeating a kdrill result to an auditor.
   tool is built to expose.
 
 Full detail, including failure modes that are not the restore's fault, in
-[docs/scope.md](docs/scope.md).
+[docs/scope.md](docs/scope.md). For a step-by-step walkthrough from an empty
+cluster to a coverage report, see [docs/howto.md](docs/howto.md).
 
 ---
 
@@ -215,6 +216,7 @@ tested. `[unverified]`
 | Container image | `registry.redhat.io/openshift4/ose-cli`. The cluster needs a valid pull secret for `registry.redhat.io`, which OpenShift normally has as part of its global pull secret. |
 | VolumeSnapshotClass | Required if your applications use PersistentVolumeClaims. Some VolumeSnapshotClass must carry the annotation `k10.kasten.io/is-snapshot-class: "true"`, or Kasten refuses to snapshot a PVC at all and the backup fails in the CSI precheck phase. Check with `oc get volumesnapshotclass -o yaml`. Note that annotating one also makes existing policies start snapshotting any PVCs in the namespaces they already back up. |
 | Spare capacity | Enough headroom to provision the restored volumes alongside production. See [docs/sizing.md](docs/sizing.md). |
+| `date` | GNU or BSD. The script detects which and refuses to run with neither, because a wrong guess makes every namespace look never tested while the log looks fine. Both are exercised. |
 | Optional | Prometheus and a Pushgateway, if you want the metrics off-cluster. Without them, metrics are still written to the job log. |
 
 ## Install
@@ -275,6 +277,13 @@ silently fall back to the default cadence. The script warns at startup if you se
 one. `[verified]` on OpenShift 4.20. Every knob is an environment variable in
 `deploy/40-cronjob.yaml`, and each one's default is in the script's
 configuration block. The script itself is never edited to change behaviour.
+
+Coverage history lives wherever you point it. `LEDGER_BACKEND=configmap`, the
+default, keeps it in a ConfigMap in the tool namespace.
+`LEDGER_BACKEND=file` with `LEDGER_FILE` keeps it in a plain TAB separated file
+instead, which is what makes a run with no Kubernetes object of its own possible.
+Either way the ledger is the coverage record: back it up, and do not delete it
+casually, because losing it makes every namespace look untested.
 
 Before you raise `MAX_NAMESPACES_PER_RUN`, check the rotation actually
 converges. The arithmetic is in [docs/sizing.md](docs/sizing.md), and it is easy
@@ -344,6 +353,42 @@ That file is generated from the CronJob, so the two paths cannot drift:
 ```bash
 hack/build-job.sh
 ```
+
+### Standalone: no Kubernetes objects at all
+
+Further still: kdrill does not need to live on the cluster. `src/restore-test.sh`
+runs from a workstation, a jump host or a CI runner against a kubeconfig, with no
+CronJob, no Job and no ConfigMap of its own. Set the ledger to a file and nothing
+Kubernetes-shaped holds kdrill's state.
+
+```bash
+export KUBECONFIG=/path/to/kubeconfig
+export EXPORT_MATCH=YOUR_PROFILE_NAME
+export LEDGER_BACKEND=file
+export LEDGER_FILE=/var/lib/kdrill/ledger
+./restore-test.sh
+```
+
+Requirements on that machine are `bash` 4 or later, `oc` or `kubectl`, a
+kubeconfig, and `date`. Nothing else. Then schedule it with whatever you already
+use:
+
+```bash
+0 3 * * 0 KUBECONFIG=/etc/kdrill/kubeconfig EXPORT_MATCH=my-profile LEDGER_BACKEND=file LEDGER_FILE=/var/lib/kdrill/ledger /opt/kdrill/restore-test.sh >> /var/log/kdrill.log 2>&1
+```
+
+The ledger file **is** the coverage record in this mode. Put it somewhere backed
+up, or in a git repository if you want the history reviewable. It is TAB
+separated, one namespace per line, sorted, so it diffs cleanly.
+
+Verified end to end from macOS against OpenShift 4.20.30: real restore of a
+namespace with a 1 GiB volume, `PASS`, ledger file written, cleanup, `rc=0`, 140
+seconds.
+
+One portability detail worth knowing, because getting it wrong is silent: GNU
+`date` and BSD `date` parse timestamps with different flags, and a wrong guess
+makes every namespace look never tested while the log looks fine. The script
+detects which one it has and refuses to run with neither.
 
 ### Four consequences of dropping the CronJob
 
@@ -451,6 +496,56 @@ separately.
 and non blocking in any case, so a missing `curl` would degrade to log-only
 metrics rather than failing the run.
 
+## Reporting
+
+The run log proves one run. The report proves coverage, which is what an auditor
+asks for.
+
+```bash
+src/kdrill-report.sh
+```
+
+```
+NAMESPACE       TIER   CADENCE  LAST_PASSED            AGE    STATUS        EXPORT_RP
+kdrill-demo     none   30d      2026-08-26T11:04:18Z   0      OK            yes
+
+in scope 1   within cadence 1   overdue 0   never tested 0   worst age 0d
+compliance 100% of namespaces in scope are within their cadence
+```
+
+It reads the coverage ledger and writes nothing, so it is safe to run at any
+time, and it works against either ledger backend. Per namespace it reports the
+tier, the cadence target that tier commits to, when the restore last passed, how
+stale that is, and whether an exported restore point exists right now for kdrill
+to use. That last column catches the case where coverage looks fine but the next
+run would find nothing to restore.
+
+Three output formats, for three audiences:
+
+```bash
+src/kdrill-report.sh --format text
+src/kdrill-report.sh --format csv > coverage.csv
+src/kdrill-report.sh --format markdown > coverage.md
+```
+
+It exits 1 if any namespace is overdue or has never been tested, so it doubles as
+a pipeline gate:
+
+```bash
+src/kdrill-report.sh --quiet || echo "coverage is not compliant"
+```
+
+Like `restore-test.sh` it is deliberately self-contained, one file with no shared
+library, so it can be copied to a jump host on its own. It takes its
+configuration from the same environment variables, so one set of settings drives
+both.
+
+**Be precise about what a row means.** `OK` means the application restored from
+its export and became Ready inside its cadence. It does not mean the data was
+checked. The report says so in its own footer, and
+[docs/scope.md](docs/scope.md) says it at length. That distinction is what
+protects you when the report is read by someone who did not build it.
+
 ## Troubleshooting
 
 The job log is the primary source. Start there:
@@ -472,7 +567,8 @@ oc -n k10-restore-test logs -l job-name --tail=200
 ## Repository layout
 
 ```
-src/restore-test.sh                     single source of truth
+src/restore-test.sh                     single source of truth, runs anywhere
+src/kdrill-report.sh                    coverage report, self-contained
 deploy/00-namespace.yaml
 deploy/10-rbac.yaml                     all permissions, in one auditable file
 deploy/20-ledger.yaml                   coverage ledger ConfigMap
@@ -485,6 +581,7 @@ examples/job-on-demand.yaml             GENERATED, the no-CronJob path
 examples/prometheusrule.yaml
 examples/validatingadmissionpolicy-ns-delete-guardrail.yaml   the guardrail of record
 examples/kyverno-ns-delete-guardrail.yaml                     alternative, if you run Kyverno
+docs/howto.md                           step-by-step, all three run paths
 docs/scope.md                           the long form of the scope statement
 docs/sizing.md                          budgets, cadence convergence, storage
 ```
