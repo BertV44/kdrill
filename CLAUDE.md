@@ -76,6 +76,14 @@ constraint. If one is challenged, say why and ask before changing it.
    the NetworkPolicy allows, and the Route exclusion in the BatchRestoreAction.
    `KDRILL_PLATFORM` forces the answer when detection is wrong. Adding a fifth
    divergence is a decision to take deliberately, not to slip in.
+12. **The ingress path is excluded on both platforms**, by whichever resource owns
+   it there: Routes on OpenShift, Ingress on vanilla Kubernetes. The reasons
+   differ in severity. On OpenShift a duplicate `spec.host` is refused outright,
+   so the worst case is a failed test. On Kubernetes a typical controller accepts
+   two Ingresses claiming one host, so the worst case is production traffic
+   reaching a restored copy. Note that OpenShift also materialises Routes from
+   Ingress objects, so an OpenShift application that uses Ingress rather than
+   Route is not covered by the Route filter alone. Decided 2026-08-26.
 11. **The guardrail of record is a ValidatingAdmissionPolicy**, not Kyverno. It is
    native from Kubernetes 1.30, needs nothing installed, and behaves identically
    on both platforms. The Kyverno variant is kept for clusters already running it.
@@ -179,20 +187,35 @@ These are the open risks. Do not silently resolve them by guessing.
    secret, which a vanilla cluster does not have. A replacement providing bash
    plus kubectl is needed and none has been tested. This is the main remaining gap
    in the agnostic claim: the script is portable, the shipped CronJob is not.
-10. **Ingress on vanilla Kubernetes.** `[unverified]` Decision 4 excludes OpenShift
-   Routes because a duplicate `spec.host` fails with `HostAlreadyClaimed`. The
-   vanilla analogue is not handled: nothing filters `networking.k8s.io` Ingress
-   objects, so a restore would recreate them with production hostnames. A typical
-   ingress controller accepts the duplicate rather than refusing it, so the
-   failure mode is production traffic reaching a restored copy, which is worse
-   than a failed test. Needs a decision: exclude Ingress symmetrically with
-   Routes, or document vanilla Kubernetes as OpenShift-only until confirmed.
-   Deliberately not decided unilaterally.
-11. **A real end-to-end restore.** `[unverified]` No restore has been executed.
-   The reference cluster holds restore points only for `openshift-etcd` and
-   `kasten-io`, both excluded as system namespaces, so the eligible pool is empty
-   and no application has been restored yet. Everything up to and including
-   selection is exercised; the BatchRestoreAction path is not.
+10. **RESOLVED 2026-08-26 by decision.** Ingress on vanilla Kubernetes is now
+   excluded symmetrically with Routes. See architecture decision 12. The
+   behaviour of a duplicate Ingress host on a specific controller remains
+   `[unverified]`, but it no longer matters, because the object is filtered out
+   before it can be created.
+11. **PARTLY RESOLVED 2026-08-26. End-to-end restore.** A full cycle ran to
+   success in-cluster, as a Job using the real ServiceAccount, image and mounted
+   ConfigMap: 1 namespace eligible, the exported restore point selected, target
+   namespace created with network isolation, BatchRestoreAction Pending then
+   Complete at 100 percent, `PASS kdrill-demo`, ledger written, target namespace
+   deleted through the guardrail, BatchRestoreAction cleaned up, source namespace
+   untouched, `rc=0`. Total elapsed 79 seconds.
+   **Still not proven: volume restore.** The test application was switched to
+   `emptyDir` because the lab has no VolumeSnapshotClass carrying
+   `k10.kasten.io/is-snapshot-class: "true"`, so `exportType` was
+   `appConfigOnly` and no PersistentVolume was provisioned or attached. The
+   headline claim in the scope statement, that volumes provision and attach from
+   exported data, is therefore still `[unverified]`. Re-run with a PVC once a
+   snapshot class is annotated.
+12. **Volume backup prerequisite, discovered 2026-08-26.** `[verified]` Kasten
+   cannot snapshot a PVC unless some VolumeSnapshotClass carries the annotation
+   `k10.kasten.io/is-snapshot-class: "true"`. Without it a backup of a namespace
+   holding a PVC fails in the CSI precheck phase with "Failed to find
+   VolumeSnapshotClass with annotation in the cluster". The reference lab has a
+   `lvms-vg1` VolumeSnapshotClass for driver `topolvm.io` but it is unannotated,
+   which is why no volume backup had ever succeeded there. Annotating it also
+   changes existing policies: `k10-disaster-recovery-policy` backs up `kasten-io`,
+   which does hold PVCs, so it would begin snapshotting them. Not done, it is a
+   cluster-wide decision.
 
 ---
 

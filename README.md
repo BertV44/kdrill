@@ -121,11 +121,19 @@ Verified on a live cluster, OpenShift 4.20.30 / Kubernetes 1.33.13, Kasten 9.0.4
   namespace, or create a BatchRestoreAction outside the Kasten namespace
 - the admission guardrail proven to deny and to allow the right things
 
-**Not yet done: an actual restore.** The reference cluster holds restore points
-only for `openshift-etcd` and `kasten-io`, both excluded as system namespaces, so
-the eligible pool is empty and no application has been restored. Everything up to
-and including selection works; the BatchRestoreAction path is unexercised. Treat
-the first real run as a lab exercise and read the open items below.
+- **a full restore cycle run to success in-cluster**, as a Job using the real
+  ServiceAccount, image and mounted ConfigMap. 79 seconds end to end: exported
+  restore point selected, target namespace created and isolated,
+  BatchRestoreAction Complete at 100 percent, `PASS`, ledger written, target
+  namespace deleted through the guardrail, source namespace untouched, `rc=0`
+
+**One thing in the scope statement is still not proven: volume restore.** That run
+used an application with no PersistentVolumeClaim, because the reference lab has
+no VolumeSnapshotClass annotated with `k10.kasten.io/is-snapshot-class: "true"`
+and Kasten therefore refuses to snapshot a PVC at all. `exportType` was
+`appConfigOnly`, so no volume was provisioned or attached. Everything else in
+"what a passing run proves" held; the volume claim did not get tested. Annotate a
+snapshot class and re-run with a PVC before repeating that claim.
 
 ---
 
@@ -427,7 +435,12 @@ rather than a documentation gap:
 
 **Still open**, worth knowing before you interpret a failure:
 
-1. **No end-to-end restore has run.** See Status above. This is the biggest gap.
+1. **Volume restore is untested.** See Status above. This is the biggest gap,
+   because it is the part of the scope statement people care about most. It needs
+   a VolumeSnapshotClass annotated with `k10.kasten.io/is-snapshot-class: "true"`,
+   without which Kasten will not snapshot a PVC at all. Note that annotating one
+   also affects existing policies: any policy already backing up a namespace that
+   holds PVCs will start snapshotting them.
 2. **The CronJob image is not portable.** See [Platform](#platform).
 3. **Cross-namespace image pull**, **operator-managed applications**,
    **StorageClass reclaim policy** and the **Kasten concurrency limiter

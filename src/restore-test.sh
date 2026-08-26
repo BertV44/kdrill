@@ -472,17 +472,33 @@ build_bra() {
   echo "spec:"
   echo "  targetNamespaceSuffix: \"${SUFFIX}\""
   echo "  skipWaitForWorkloadReady: false"
-  # Routes only exist on OpenShift. Restoring one with an explicit spec.host
-  # into a second namespace on the same cluster collides with the original
-  # (HostAlreadyClaimed), so they are excluded there. On vanilla Kubernetes the
-  # group does not exist and the filter is omitted entirely rather than naming
-  # an absent API group.
+  # The ingress path is excluded on both platforms, by the resource that owns
+  # it there. This is the same trade in both cases: the restored copy is never
+  # reachable from outside, and the ingress configuration is not covered by the
+  # test. docs/scope.md states that consequence.
+  #
+  # OpenShift: a Route with an explicit spec.host collides with the original
+  # and fails with HostAlreadyClaimed. A hard failure, but a failure.
+  #
+  # Kubernetes: an Ingress duplicating a production host does NOT usually fail.
+  # A typical controller accepts both and resolves it by its own rules, so the
+  # restored copy can end up serving production traffic. That is worse than a
+  # failed test, which is why the filter is not optional here.
+  #
+  # Note for OpenShift readers: OpenShift also accepts Ingress objects and
+  # materialises a Route from them, so an application that uses Ingress rather
+  # than Route on OpenShift is not covered by the Route filter alone. Add
+  # ingresses to the OpenShift branch if that is your case.
+  echo "  filters:"
+  echo "    excludeResources:"
   if [ "$IS_OPENSHIFT" = "true" ]; then
-    echo "  filters:"
-    echo "    excludeResources:"
     echo "      - group: route.openshift.io"
     echo "        version: v1"
     echo "        resource: routes"
+  else
+    echo "      - group: networking.k8s.io"
+    echo "        version: v1"
+    echo "        resource: ingresses"
   fi
   echo "  subjects:"
   for i in "${!SUBJECT_NS[@]}"; do

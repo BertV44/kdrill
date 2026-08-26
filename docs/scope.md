@@ -56,18 +56,17 @@ and infer more than is being claimed.
   router, and the ingress configuration is never exercised. If your recovery
   concern includes DNS and routing, this test does not cover it.
 
-  **On vanilla Kubernetes this exclusion does not apply, and that is a risk, not
-  a feature.** `[unverified]` There are no Routes, so nothing is filtered, and
-  the restore will recreate the application's `Ingress` objects in the target
-  namespace with the same hosts as production. Unlike OpenShift, which refuses
-  the duplicate outright, a typical ingress controller will accept two Ingresses
-  claiming one host and resolve it by its own rules. The failure mode is
-  therefore worse than a failed test: production traffic could be routed to a
-  restored copy. Until this is settled, either run kdrill on OpenShift only, or
-  add `networking.k8s.io/v1 ingresses` to the `excludeResources` filter in
-  `build_bra`, or confirm on your own controller that a duplicate host is inert.
-  This has not been decided in `build_bra` because excluding Ingress is an
-  architecture decision, not a portability detail.
+  On vanilla Kubernetes, `networking.k8s.io` Ingress objects are excluded
+  instead, for a sharper reason. OpenShift refuses a duplicate `spec.host`
+  outright, so the worst case there is a failed test. A typical ingress
+  controller accepts two Ingresses claiming one host and resolves it by its own
+  rules, so the worst case is production traffic reaching a restored copy. The
+  filter removes that possibility rather than relying on the controller.
+
+  One gap to know about: OpenShift also materialises Routes from Ingress
+  objects, so an OpenShift application that uses Ingress rather than Route is
+  not covered by the Route filter alone. Add `ingresses` to the OpenShift branch
+  of `build_bra` if that is your case.
 - **Cluster loss recovery.** kdrill restores onto a working cluster, using a
   working Kasten install, reading a working catalog. It says nothing about
   recovering when the cluster or Kasten itself is gone. That is the separate
